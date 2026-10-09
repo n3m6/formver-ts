@@ -45,6 +45,7 @@ import {
   type FactIR,
   type FunctionIR,
   type ImportedSpec,
+  type LoopIR,
   type ObligationKind,
   type ObligationSite,
   type SignatureIR,
@@ -137,9 +138,7 @@ function freshId(): number {
 
 function pushed(ctx: Ctx, binder: Binder): Ctx {
   return { ...ctx, binders: [...ctx.binders, binder] };
-}
-
-// ---------------------------------------------------------------------------
+}// ---------------------------------------------------------------------------
 // Slots
 // ---------------------------------------------------------------------------
 
@@ -241,7 +240,9 @@ function instantiateTop(body: Term, arg: Term): Term {
  * postcondition mentions them (see `bindReturnValue`).
  */
 function containsProofCarrier(e: ExprIR): boolean {
-  if (e.kind === "call" || e.kind === "index" || e.kind === "slice" || e.kind === "append") return true;
+  if (e.kind === "index" || e.kind === "slice" || e.kind === "append") return true;
+  // A prelude call is a kernel definition (`divFloor`, `ifLe`): it needs no obligation proof.
+  if (e.kind === "call" && e.callee?.kind !== "prelude") return true;
   if (e.args.some(containsProofCarrier)) return true;
   if (e.vecLength !== undefined && containsProofCarrier(e.vecLength)) return true;
   if (e.cond !== undefined) {
@@ -482,13 +483,60 @@ interface SolveDetail {
   readonly counterexample?: Readonly<Record<string, string>>;
 }
 
+/** What a `continue` statement needs from the loop being elaborated. */
+interface LoopContext {
+  readonly loop: LoopIR;
+  /** `ih`, the induction hypothesis of the loop's `step`. */
+  readonly ih: Binder;
+  /** The measure function `m : A -> Int`, in the context of the loop. */
+  readonly measure: Term;
+  /** The invariant `Inv : A -> Type 0`, in the context of the loop. */
+  readonly invariant: Term;
+  /** The carried variables, in tuple order. */
+  readonly components: readonly Component[];
+  /** The elaborator's context depth where the loop's state tuple lives. */
+  readonly stateDepth: number;
+}
+
+/** One component of a tuple: the name and type for the `Sigma` annotations, and the path. */
+interface Component {
+  readonly name: string;
+  /** The kernel type of the component (a closed-relative-to-`ctx` term). */
+  readonly type: Term;
+  /** Its path from the tuple root: `[1] * i + [0]`. */
+  readonly path: readonly number[];
+}
+
+/** What the body of a recursive function needs to build a recursive call. */
+interface RecursionContext {
+  /** The argument tuple binder `x : A`. */
+  readonly tuple: Binder;
+  /** `ih`, the induction hypothesis of the `step`. */
+  readonly ih: Binder;
+  /** The measure function `m : A -> Int`, in the enclosing context. */
+  readonly measure: Term;
+  /** The measure as a term of the *body* context (`m x`), for the entry obligation. */
+  readonly components: readonly Component[];
+  /** The argument tuple type `A`, in the enclosing context. */
+  readonly tupleType: Term;
+  /** The `@pre` binders absorbed by `B`, in order. */
+  readonly preBinders: readonly Binder[];
+}
+
 class Elaborator {
   private readonly env: K.Env;
   private readonly fn: FunctionIR;
   private readonly options: ElaborateOptions;
   private readonly diagnostics: Diagnostic[] = [];
-  /** Proof per site id; a placeholder sits here for a site that is not certified. */
-  private readonly proofs = new Map<number, Term>();
+  /**
+   * Proof per site id, with the depth it was built at.  A site's proof is a term in the site's
+   * own context; using it deeper (the `index` proof that a later `elems_a i p` fact needs, for
+   * example) requires weakening it, which `proofAt` does.  A placeholder sits here for a site
+   * that is not certified.
+   */
+  private readonly proofs = new Map<number, { readonly term: Term; readonly depth: number }>();
+  /** `proofsAt` memoises one shifted view per depth; a new proof invalidates them all. */
+  private readonly proofViews = new Map<number, ReadonlyMap<number, Term>>();
   private readonly outcomes = new Map<number, ObligationOutcome>();
   private readonly visited = new Set<number>();
   /** Hypotheses of the expression currently being built (the `override` hook reads this). */
@@ -496,10 +544,40 @@ class Elaborator {
   /** Built call applications, keyed by the call node (see `callInfo`). */
   private readonly callCache = new Map<
     ExprIR,
-    { packed: Term; packedType?: Term; applied: Map<number, Term> }
+    { depth: number; packed: Term; packedType?: Term; applied: Map<number, Term> }
   >();
   private auxCount = 0;
   private readonly dependsOnUncertified = new Set<string>();
+
+  /**
+   * Extraction-time position of each binder the elaborator has in scope, keyed by binder id.
+   *
+   * The extractor's stored terms (`Binder.type`, a site's `context`) are written in the
+   * context of the *preceding extractor binders*.  The elaborator's own context is in the
+   * final kernel layout, which may differ: a loop binds `ih` where the extractor binds
+   * `hinv`, and a recursive function substitutes its parameters by a tuple.  The recorded
+   * position is what `fromExtractor` renames by, so a stored term never has to be trusted
+   * to have the same layout.
+   */
+  private readonly extOf = new Map<number, number>();
+  /** Binders whose `type` this module built itself (never in the extractor's layout). */
+  private readonly ownType = new Set<number>();
+  /**
+   * Binders whose every *use* is replaced by a value: a `let` local whose value carries no
+   * proof argument (so a fact about the value lines up with a goal), and a recursive
+   * function's parameters (replaced by a projection of the argument tuple).
+   */
+  private readonly inlineSlots = new Map<number, (ctx: Ctx) => Term | undefined>();
+  /**
+   * The extractor's position of such a binder, when stored *terms* that mention it must be
+   * substituted too (a recursive function's parameters).  A `let` local is left alone here:
+   * it is still a real variable in the kernel context.
+   */
+  private readonly inlineExt = new Map<number, (ctx: Ctx) => Term | undefined>();
+  /** The loop whose body is being elaborated (a `continue` needs its `ih`). */
+  private readonly loopStack: LoopContext[] = [];
+  /** A recursive function's argument tuple (`x`), while its body is elaborated. */
+  private recursion: RecursionContext | null = null;
 
   constructor(env: K.Env, fn: FunctionIR, options: ElaborateOptions) {
     this.env = env;
@@ -510,17 +588,13 @@ class Elaborator {
   // ---- entry point --------------------------------------------------------
 
   run(): ElaborationOutcome {
-    if (this.fn.recursive || this.fn.loops.length > 0) {
-      this.internal(
-        this.fn.nameSpan,
-        `\`${this.fn.name}\` uses ${this.fn.recursive ? "recursion" : "a loop"}, and loop and ` +
-          `recursive-function elaboration is not implemented yet (milestone 7 part B); only ` +
-          `the straight-line fragment is elaborated`,
-      );
-      return this.finish("failed");
-    }
-
+    // The signature binders are the extractor's first binders: record their positions so a
+    // stored term that mentions one can be renamed into the elaborator's own context.
+    this.fn.signature.binders.forEach((binder, position) => this.extOf.set(binder.id, position));
     const ctx: Ctx = { binders: this.fn.signature.binders, facts: [], narrowings: [], ids: new Ids() };
+
+    if (this.fn.recursive) return this.runRecursive(ctx);
+
     const hyps = this.signatureHyps(ctx);
 
     let body: Term;
@@ -555,6 +629,248 @@ class Elaborator {
       return this.finish("failed", term);
     }
     return this.finish(smtOnly ? "smt-only" : "certified", term);
+  }
+
+  // ---- extractor layouts --------------------------------------------------
+
+  /**
+   * A term stored by the extractor, whose free variables refer to the first `extDepth`
+   * extractor binders, as a term of `ctx`.
+   *
+   * `ctx` is usually the current context, but the `context` of an obligation needs each
+   * binder's type *in the preceding binders*, so there it is a prefix of the current one.
+   * Binders the elaborator substitutes (a recursive function's parameters) are replaced by
+   * their value; a binder that is missing entirely is an error, never a silent misread.
+   */
+  private fromExtractor(ctx: Ctx, term: Term, extDepth: number): Term {
+    const args = new Map<number, Term>();
+    for (const binder of ctx.binders) {
+      const position = this.extOf.get(binder.id);
+      if (position === undefined || position >= extDepth) continue;
+      args.set(extDepth - 1 - position, K.varTerm(deBruijnIndex(ctx, binder)));
+    }
+    for (const [position, value] of this.inlineExt) {
+      if (position >= extDepth) continue;
+      const replacement = value(ctx);
+      if (replacement !== undefined) args.set(extDepth - 1 - position, replacement);
+    }
+    try {
+      return substituteFree(term, args);
+    } catch (error) {
+      throw new ElaborateFailure(
+        `a term stored by the extractor (${K.formatTerm(term)}) mentions a binder this context does not have: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  }
+
+  /**
+   * A binder's type, as a term of `ctx`.  A type the extractor stored is renamed from the
+   * extractor's layout; a type this module built (`ownType`: the state tuple, `px`, `ih`, the
+   * invariant) is written in the context that was current when the binder was pushed, so it
+   * only needs lifting past the later binders.
+   */
+  private binderTypeAt(ctx: Ctx, binder: Binder): Term {
+    const at = ctx.binders.findIndex((candidate) => candidate.id === binder.id);
+    // The binder in scope may be this module's own copy (the state tuple, `px`, `ih`, the
+    // invariant); a fact still refers to the extractor's object.
+    const bound = at < 0 ? binder : ctx.binders[at]!;
+    if (!this.ownType.has(bound.id)) {
+      const position = this.extOf.get(bound.id);
+      if (position !== undefined) return this.fromExtractor(ctx, bound.type, position);
+    }
+    if (at < 0) return bound.type;
+    return shiftTerm(bound.type, ctx.binders.length - at);
+  }
+
+  /** The proof of a site, weakened from the depth it was built at to `depth`. */
+  private proofAt(siteId: number, depth: number): Term | undefined {
+    const entry = this.proofs.get(siteId);
+    if (entry === undefined) return undefined;
+    if (entry.depth === depth) return entry.term;
+    if (entry.depth > depth) {
+      throw new ElaborateFailure(
+        `the proof of obligation ${siteId} was built at depth ${entry.depth} and cannot be used at depth ${depth}`,
+      );
+    }
+    return shiftTerm(entry.term, depth - entry.depth);
+  }
+
+  /** Record a site's proof, keeping the shallowest one (it can be weakened to any deeper use). */
+  private storeProof(siteId: number, term: Term, depth: number): void {
+    const existing = this.proofs.get(siteId);
+    if (existing !== undefined && existing.depth <= depth) return;
+    this.proofs.set(siteId, { term, depth });
+    this.proofViews.clear();
+  }
+
+  /** The whole store, weakened to `depth` (what `exprTerm` reads for `index`/`slice`/`append`). */
+  private proofsAt(depth: number): ReadonlyMap<number, Term> {
+    const cached = this.proofViews.get(depth);
+    if (cached !== undefined) return cached;
+    const view = new Map<number, Term>();
+    for (const [id, entry] of this.proofs) {
+      view.set(id, entry.depth === depth ? entry.term : shiftTerm(entry.term, depth - entry.depth));
+    }
+    this.proofViews.set(depth, view);
+    return view;
+  }
+
+  /** The next extractor position along the current path. */
+  private nextExtDepth(ctx: Ctx): number {
+    let max = -1;
+    for (const binder of ctx.binders) {
+      const position = this.extOf.get(binder.id);
+      if (position !== undefined) max = Math.max(max, position);
+    }
+    return max + 1;
+  }
+
+  /** Push an *extractor* binder: it takes the next extraction position. */
+  private pushExt(ctx: Ctx, binder: Binder): Ctx {
+    this.extOf.set(binder.id, this.nextExtDepth(ctx));
+    return pushed(ctx, binder);
+  }
+
+  /** The `TermOptions` hooks this elaborator supplies (proofs, calls, inlined slots). */
+  private get slotHooks(): Pick<TermOptions, "inlineSlots"> {
+    return { inlineSlots: (ctx, slot) => this.inlineSlotTerm(ctx, slot) };
+  }
+
+  private inlineSlotTerm(ctx: Ctx, slot: Slot): Term | undefined {
+    if (slot.kind !== "binder") return undefined;
+    return this.inlineSlots.get(slot.binder.id)?.(ctx);
+  }
+
+  /**
+   * The ambient binder types `certify` rebuilds its kernel context from: `types[p]` is the
+   * type of the binder at position `p`, in the context of the *preceding* binders.  A type
+   * the extractor stored is renamed from the extractor's layout; a type this module built is
+   * already written in the context that was current when the binder was pushed.
+   */
+  private contextTypes(ctx: Ctx): Term[] {
+    return ctx.binders.map((binder, position) => {
+      const prefix: Ctx = { ...ctx, binders: ctx.binders.slice(0, position) };
+      return this.binderTypeAt(prefix, binder);
+    });
+  }
+
+  /** Atom names for counterexamples, with every loop-state projection named after its variable. */
+  private atomNamesFor(ctx: Ctx): Record<string, string> {
+    const depth = ctx.binders.length;
+    const names = contextAtomNames(
+      depth,
+      ctx.binders.map((binder) => binder.surface ?? binder.name),
+    );
+    const values = Array.from({ length: depth }, (_, level) => K.vvar(level));
+    for (const frame of this.loopStack) {
+      const state = frame.loop.state;
+      if (!ctx.binders.some((binder) => binder.id === state.id)) continue;
+      const variable = K.varTerm(deBruijnIndex(ctx, state));
+      for (const component of frame.components) {
+        try {
+          const value = K.evalTerm(this.env, project(variable, component.path), values);
+          names[K.keyOfValue(value, K.irrelevantOf)] = component.name;
+        } catch {
+          // A component whose term cannot be evaluated simply keeps its positional name.
+        }
+      }
+    }
+    return names;
+  }
+
+  /**
+   * `divFloorSpec`/`divTruncSpec*` for every division the obligation mentions.  The
+   * extractor records the fact where the division *node* is, but a goal is often stated
+   * about a `let`-bound local holding the quotient (`let mid = Math.floor((lo+hi)/2)`), and
+   * a division by a constant is an opaque atom to Z3: the fact has to be stated about the
+   * very term the goal mentions, which is what rebuilding it here guarantees.
+   */
+  private divisionFacts(ctx: Ctx, terms: readonly Term[], hyps: readonly Hyp[]): Hyp[] {
+    const depth = ctx.binders.length;
+    const out: Hyp[] = [];
+    const seen = new Set<string>();
+    const visit = (term: Term): void => {
+      switch (term.tag) {
+        case "Prim": {
+          if (term.op === K.OP_DIV_FLOOR || term.op === K.OP_DIV_TRUNC) {
+            const e = term.args[0];
+            const k = term.args[1];
+            if (e !== undefined && k !== undefined) {
+              const key = `${term.op}|${K.formatTerm(term)}`;
+              if (!seen.has(key)) {
+                seen.add(key);
+                const fact = this.divisionFactFor(term.op, e, k, hyps, depth);
+                if (fact !== null) out.push(fact);
+              }
+            }
+          }
+          for (const arg of term.args) visit(arg);
+          return;
+        }
+        case "Pi":
+        case "Lam":
+          visit(term.domain);
+          visit(term.body);
+          return;
+        case "Sigma":
+          visit(term.first);
+          visit(term.second);
+          return;
+        case "Let":
+          visit(term.type);
+          visit(term.value);
+          visit(term.body);
+          return;
+        case "App":
+          visit(term.fn);
+          visit(term.arg);
+          return;
+        case "Pair":
+          visit(term.sigma);
+          visit(term.first);
+          visit(term.second);
+          return;
+        case "Fst":
+        case "Snd":
+          visit(term.pair);
+          return;
+        case "Farkas":
+          for (const hyp of term.hyps) visit(hyp);
+          return;
+        default:
+          return;
+      }
+    };
+    for (const term of terms) visit(term);
+    return out;
+  }
+
+  /** The lemma for one division: `divFloorSpec`, or a `divTruncSpec*` that needs a sign. */
+  private divisionFactFor(
+    op: K.PrimOp,
+    e: Term,
+    k: Term,
+    hyps: readonly Hyp[],
+    depth: number,
+  ): Hyp | null {
+    if (op === K.OP_DIV_FLOOR) {
+      const fact = K.DivFloorSpec(e, k);
+      return { term: fact, proof: fact, depth, origin: "division-spec" };
+    }
+    for (const hyp of hyps) {
+      const at = hypAt(hyp, depth);
+      if (sameTerm(at.term, K.Le(K.intLit(0n), e))) {
+        const fact = K.DivTruncSpecNonneg(e, k, at.proof);
+        return { term: fact, proof: fact, depth, origin: "division-spec" };
+      }
+      if (sameTerm(at.term, K.Lt(e, K.intLit(0n)))) {
+        const fact = K.DivTruncSpecNeg(e, k, at.proof);
+        return { term: fact, proof: fact, depth, origin: "division-spec" };
+      }
+    }
+    return null;
   }
 
   /** Add the declaration the verdict allows, then report. */
@@ -660,7 +976,8 @@ class Elaborator {
       if (vec.type.tag !== "Prim" || vec.type.op !== K.OP_VEC) continue;
       const n = K.varTerm(index(len));
       const v = K.varTerm(index(vec));
-      const elem = shiftTerm(vec.type.args[0]!, depth - (i + 1));
+      const vecType = this.binderTypeAt(ctx, vec);
+      const elem = vecType.tag === "Prim" ? vecType.args[0]! : vec.type.args[0]!;
       out.push({
         term: K.And(K.Le(K.intLit(0n), n), K.Le(n, K.intLit(K.MAX_VEC_LEN))),
         proof: K.VecBounds(elem, n, v),
@@ -684,19 +1001,29 @@ class Elaborator {
 
   private factHyp(ctx: Ctx, fact: FactIR, opts: TermOptions, depth: number): Hyp | null {
     if (fact.binder !== undefined) {
-      // The binder's own type *is* the proposition its variable proves; using it (shifted
-      // to this context) keeps the hypothesis and the proof in step even where the
-      // extractor's rendering differs (an `if (a === b)` branch, for example, binds
-      // `Le a b`, not `Eq Int a b`).
-      const position = ctx.binders.findIndex((binder) => binder.id === fact.binder!.id);
-      if (position < 0) return null;
-      return {
-        term: shiftTerm(fact.binder.type, depth - position),
-        proof: K.varTerm(deBruijnIndex(ctx, fact.binder)),
-        depth,
-        prop: fact.prop,
-        origin: fact.origin,
-      };
+      // The binder's own type *is* the proposition its variable proves; using it keeps the
+      // hypothesis and the proof in step even where the extractor's rendering differs (an
+      // `if (a === b)` branch, for example, binds `Le a b`, not `Eq Int a b`).
+      const binder = fact.binder;
+      if (ctx.binders.some((candidate) => candidate.id === binder.id)) {
+        return {
+          term: this.binderTypeAt(ctx, binder),
+          proof: K.varTerm(deBruijnIndex(ctx, binder)),
+          depth,
+          prop: fact.prop,
+          origin: fact.origin,
+        };
+      }
+      // The binder is *inlined* (a recursive function's parameter, replaced by a projection
+      // of the argument tuple): restate the proposition from the IR and prove it with the
+      // value the binder stands for.
+      const proof = this.inlineSlots.get(binder.id)?.(ctx);
+      if (proof === undefined) return null;
+      try {
+        return { term: exprTerm(ctx, fact.prop, opts), proof, depth, prop: fact.prop, origin: fact.origin };
+      } catch {
+        return null;
+      }
     }
     switch (fact.origin) {
       case "vec-bounds":
@@ -717,16 +1044,16 @@ class Elaborator {
     const lenBinder = lenRef?.slot?.kind === "binder" ? lenRef.slot.binder : undefined;
     if (lenBinder === undefined) return null;
     const lenIndex = deBruijnIndex(ctx, lenBinder);
-    for (let i = 0; i < ctx.binders.length; i += 1) {
-      const vec = ctx.binders[i]!;
+    for (const vec of ctx.binders) {
       if (vec.role !== "param" || vec.type.tag !== "Prim" || vec.type.op !== K.OP_VEC) continue;
-      const second = vec.type.args[1];
-      if (second === undefined || second.tag !== "Var") continue;
-      if (second.index + (depth - (i + 1)) !== lenIndex) continue;
+      const vecType = this.binderTypeAt(ctx, vec);
+      if (vecType.tag !== "Prim") continue;
+      const second = vecType.args[1];
+      if (second === undefined || second.tag !== "Var" || second.index !== lenIndex) continue;
       const n = K.varTerm(lenIndex);
       return {
         term: K.And(K.Le(K.intLit(0n), n), K.Le(n, K.intLit(K.MAX_VEC_LEN))),
-        proof: K.VecBounds(shiftTerm(vec.type.args[0]!, depth - (i + 1)), n, K.varTerm(deBruijnIndex(ctx, vec))),
+        proof: K.VecBounds(vecType.args[0]!, n, K.varTerm(deBruijnIndex(ctx, vec))),
         depth,
         origin: "vec-bounds",
       };
@@ -738,7 +1065,7 @@ class Elaborator {
   private elementRangeHyp(ctx: Ctx, fact: FactIR, opts: TermOptions, depth: number): Hyp | null {
     const node = fact.prop.args[0];
     if (node === undefined || node.kind !== "index" || node.siteId === undefined) return null;
-    const proof = this.proofs.get(node.siteId);
+    const proof = this.proofAt(node.siteId, depth);
     if (proof === undefined) return null;
     const vec = node.args[0];
     const index = node.args[1];
@@ -806,8 +1133,9 @@ class Elaborator {
 
   private optionsFor(extra?: { result?: Term }): TermOptions {
     const base: TermOptions = {
-      proofs: this.proofs,
+      proofAt: (siteId, depth) => this.proofAt(siteId, depth),
       override: (ctx, e, opts) => this.overrideTerm(ctx, e, opts),
+      inlineSlots: (ctx, slot) => this.inlineSlotTerm(ctx, slot),
     };
     return extra?.result === undefined ? base : { ...base, result: extra.result };
   }
@@ -854,14 +1182,16 @@ class Elaborator {
     ctx: Ctx,
     e: ExprIR,
     opts: TermOptions,
-  ): { packed: Term; packedType?: Term; applied: Map<number, Term> } {
+  ): { depth: number; packed: Term; packedType?: Term; applied: Map<number, Term> } {
+    const depth = ctx.binders.length;
     const cached = this.callCache.get(e);
-    if (cached !== undefined) return cached;
+    if (cached !== undefined && cached.depth === depth) return cached;
     const callee = e.callee;
     if (callee === undefined) throw new ElaborateFailure("a call expression without a callee");
     if (callee.kind === "prelude") {
       const built = callee.builtin!.build(e.args.map((arg) => exprTerm(ctx, arg, opts)));
-      const info: { packed: Term; packedType?: Term; applied: Map<number, Term> } = {
+      const info: { depth: number; packed: Term; packedType?: Term; applied: Map<number, Term> } = {
+        depth,
         packed: built,
         applied: new Map<number, Term>(),
       };
@@ -886,7 +1216,7 @@ class Elaborator {
       paramInfo.set(binder.id, { term: exprTerm(ctx, expr, opts), expr });
     });
 
-    const preProofs = this.preCallProofs(e);
+    const preProofs = this.preCallProofs(e, depth);
     const typeArgs = this.typeArguments(ctx, signature, e.args);
     const applied = new Map<number, Term>();
     const ordered: Term[] = [];
@@ -948,7 +1278,8 @@ class Elaborator {
           throw new ElaborateFailure(`unsupported binder role \`${binder.role}\` in \`${callee.name}\``);
       }
     }
-    const info: { packed: Term; packedType?: Term; applied: Map<number, Term> } = {
+    const info: { depth: number; packed: Term; packedType?: Term; applied: Map<number, Term> } = {
+      depth,
       packed: K.appMany(K.constTerm(callee.name), ordered),
       applied,
     };
@@ -1040,7 +1371,7 @@ class Elaborator {
   }
 
   /** The pre-call site's proof, split into one proof per precondition binder. */
-  private preCallProofs(e: ExprIR): Term[] {
+  private preCallProofs(e: ExprIR, depth: number): Term[] {
     const callee = e.callee;
     const count = callee === undefined || callee.kind === "prelude" ? 0 : (this.signatureOf(callee)?.preconditions.length ?? 0);
     const site = e.sites.find((s) => s.kind === "pre-call");
@@ -1048,7 +1379,7 @@ class Elaborator {
       if (count === 0) return [];
       throw new ElaborateFailure("the call has preconditions but no pre-call obligation");
     }
-    const proof = this.proofs.get(site.id);
+    const proof = this.proofAt(site.id, depth);
     if (proof === undefined) throw new ElaborateFailure("the pre-call obligation of this call was not certified");
     const out: Term[] = [];
     for (let i = 0; i < count; i += 1) {
@@ -1165,7 +1496,7 @@ class Elaborator {
   private appendTerm(ctx: Ctx, e: ExprIR, opts: TermOptions): Term {
     const elem = this.elemType(ctx, e.type.elem!);
     const site = e.sites.find((s) => s.kind === "append-length");
-    const siteProof = site === undefined ? undefined : this.proofs.get(site.id);
+    const siteProof = site === undefined ? undefined : this.proofAt(site.id, ctx.binders.length);
     if (siteProof === undefined) throw new ElaborateFailure("the append-length obligation was not certified");
 
     const parts = e.args;
@@ -1256,8 +1587,8 @@ class Elaborator {
       const union = cond.tagTest.union;
       const thenVariant = cond.thenNarrowings[0]?.variant ?? otherVariant(union, cond.tagTest.variant);
       const elseVariant = cond.elseNarrowings[0]?.variant ?? cond.tagTest.variant;
-      const thenCtx = pushed(ctx, cond.thenBinder);
-      const elseCtx = pushed(ctx, cond.elseBinder);
+      const thenCtx = this.pushExt(ctx, cond.thenBinder);
+      const elseCtx = this.pushExt(ctx, cond.elseBinder);
       if (cond.thenExpr !== undefined) {
         this.prepare(
           thenCtx,
@@ -1278,8 +1609,8 @@ class Elaborator {
     }
 
     const [a, b] = this.ifLeOperands(ctx, cond.expr, opts);
-    const thenCtx = pushed(ctx, cond.thenBinder);
-    const elseCtx = pushed(ctx, cond.elseBinder);
+    const thenCtx = this.pushExt(ctx, cond.thenBinder);
+    const elseCtx = this.pushExt(ctx, cond.elseBinder);
     if (cond.thenExpr !== undefined) {
       this.prepare(
         thenCtx,
@@ -1310,7 +1641,7 @@ class Elaborator {
     const out: Hyp[] = [];
     for (const site of e.sites) {
       if (site.kind !== "range") continue;
-      const proof = this.proofs.get(site.id);
+      const proof = this.proofAt(site.id, depth);
       if (proof === undefined) continue;
       try {
         out.push({ term: exprTerm(ctx, site.goal, opts), proof, depth, origin: "range" });
@@ -1391,7 +1722,7 @@ class Elaborator {
     if (this.visited.has(site.id)) return this.outcomes.get(site.id)?.status === "certified";
     this.visited.add(site.id);
     const solved = this.solve(ctx, hyps, site, opts, result);
-    this.proofs.set(site.id, solved.proof ?? K.tt);
+    this.storeProof(site.id, solved.proof ?? K.tt, ctx.binders.length);
     this.record(site, solved.status, solved.detail);
     if (solved.status === "certified") return true;
     this.reportFailure(site, solved);
@@ -1427,7 +1758,15 @@ class Elaborator {
     let hypotheses: Hyp[];
     try {
       goal = exprTerm(ctx, site.goal, result === undefined ? opts : { ...opts, result });
-      hypotheses = expandEquations(dedupeHyps([...hypsAt(hyps, depth), ...this.siteHyps(ctx, site, opts)]));
+      const base = [...hypsAt(hyps, depth), ...this.siteHyps(ctx, site, opts)];
+      hypotheses = expandEquations(
+        dedupeHyps([
+          ...base,
+          // A division by a constant is an opaque atom to Z3: the lemma has to be stated
+          // about the very terms the goal and the hypotheses mention.
+          ...this.divisionFacts(ctx, [goal, ...base.map((hyp) => hyp.term)], base),
+        ]),
+      );
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
       this.internal(site.span, `the ${site.kind} obligation of \`${this.fn.name}\` cannot be built: ${detail}`);
@@ -1445,14 +1784,11 @@ class Elaborator {
       id: `${this.fn.name}#${site.id}`,
       kind: site.kind,
       span: site.span,
-      context: ctx.binders.map((binder) => binder.type),
+      context: this.contextTypes(ctx),
       hypotheses: hypotheses.map((hyp) => hyp.term),
       proofs: hypotheses.map((hyp) => hyp.proof),
       goal,
-      atomNames: contextAtomNames(
-        depth,
-        ctx.binders.map((binder) => binder.surface ?? binder.name),
-      ),
+      atomNames: this.atomNamesFor(ctx),
     };
 
     const outcome = this.withHyps(hypotheses, () =>
@@ -1520,7 +1856,10 @@ class Elaborator {
     what: string,
   ): Term | undefined {
     const depth = ctx.binders.length;
-    const list = expandEquations(dedupeHyps(hypsAt(hyps, depth)));
+    const base = hypsAt(hyps, depth);
+    const list = expandEquations(
+      dedupeHyps([...base, ...this.divisionFacts(ctx, [goal, ...base.map((hyp) => hyp.term)], base)]),
+    );
     for (const hyp of list) {
       if (sameTerm(hyp.term, goal)) return hyp.proof;
     }
@@ -1529,14 +1868,11 @@ class Elaborator {
       id: `${this.fn.name}#aux${this.auxCount}`,
       kind,
       span,
-      context: ctx.binders.map((binder) => binder.type),
+      context: this.contextTypes(ctx),
       hypotheses: list.map((hyp) => hyp.term),
       proofs: list.map((hyp) => hyp.proof),
       goal,
-      atomNames: contextAtomNames(
-        depth,
-        ctx.binders.map((binder) => binder.surface ?? binder.name),
-      ),
+      atomNames: this.atomNamesFor(ctx),
     };
     const outcome = certify(this.env, obligation, { timeoutMs: this.options.timeoutMs });
     if (outcome.status === "certified" && outcome.proof !== undefined) return outcome.proof;
@@ -1564,6 +1900,238 @@ class Elaborator {
     }
   }
 
+  // ---- loops --------------------------------------------------------------
+
+  /**
+   * A `LoopIR` as `fixWf A B m step s0 p0 hinv0 : Result` (specification 6.3):
+   *
+   * ```text
+   * A    = Sigma (v0 : T0). … Unit            -- the carried-state tuple
+   * B    = fun (_ : A) => Inv s -> Result
+   * m    = fun (s : A) => <@decreases>
+   * step = fun (s : A) (px : Le 0 (m s)) (ih : (y : A) -> Le 0 (m y) -> Lt (m y) (m s) -> B y)
+   *            (hinv : Inv s) => if cond then body else rest
+   * ```
+   *
+   * `A`, `B` and `m` are rebuilt from the IR rather than taken from `LoopIR`'s stored terms:
+   * those are written in the *enclosing* context, and a loop nested in another loop would
+   * read them at the wrong depth.  `rest` — the statements after the loop — is the `else`
+   * branch, so the loop term *is* the rest of the function.  `continue` becomes an
+   * application of `ih` to the new state and the three back-edge proofs.
+   */
+  private elabLoop(ctx: Ctx, hyps: readonly Hyp[], loop: LoopIR): Term {
+    const opts = this.optionsFor();
+    const depth = ctx.binders.length;
+
+    const components = this.loopComponents(ctx, loop);
+    const stateType = this.tupleType(components);
+    const state: Binder = { ...loop.state, type: stateType };
+    this.ownType.add(state.id);
+    const stateCtx = this.pushExt(ctx, state);
+    const stateHyps = hypsAt(hyps, depth + 1);
+    const invariantTerm = this.withHyps(stateHyps, () => exprTerm(stateCtx, loop.invariant, opts));
+    const measureFn = K.lam("s", stateType, this.withHyps(stateHyps, () => exprTerm(stateCtx, loop.measure, opts)));
+    const resultType = this.resultTypeAt(ctx);
+
+    // `px : Le 0 (m s)`, bound under the state, then `ih`, then the invariant.
+    const pxType = K.Le(K.intLit(0n), K.app(shiftTerm(measureFn, 1), K.varTerm(0)));
+    const px: Binder = { id: freshId(), name: "px", role: "loop-measure-nonneg", type: pxType };
+    this.ownType.add(px.id);
+    const measureCtx = this.pushExt(stateCtx, px);
+
+    const stateVar = K.varTerm(1); // `s` in `measureCtx`
+    // `B = fun _ => Inv s -> Result`, and `ih`'s type; both are terms of `measureCtx`, so the
+    // domain `A` and the functions `m`/`B` (which live in the enclosing context) are shifted
+    // by the two binders `s` and `px` that were pushed since.
+    const predicate: Term = K.lam(
+      "_",
+      stateType,
+      K.pi("hinv", invariantTerm, shiftTerm(resultType, 2)),
+    );
+    const ihType = K.pi(
+      "y",
+      shiftTerm(stateType, 2),
+      K.pi(
+        "py",
+        K.Le(K.intLit(0n), K.app(shiftTerm(measureFn, 3), K.varTerm(0))),
+        K.pi(
+          "pd",
+          K.Lt(
+            K.app(shiftTerm(measureFn, 4), K.varTerm(1)),
+            K.app(shiftTerm(measureFn, 4), shiftTerm(stateVar, 2)),
+          ),
+          K.app(shiftTerm(predicate, 5), K.varTerm(2)),
+        ),
+      ),
+    );
+    const ih: Binder = { id: freshId(), name: "ih", role: "local", type: ihType };
+    const ihCtx = pushed(measureCtx, ih);
+
+    const hinv: Binder = { ...loop.invariantBinder, type: shiftTerm(invariantTerm, 2) };
+    this.ownType.add(hinv.id);
+    const bodyCtx = this.pushExt(ihCtx, hinv);
+    const bodyDepth = bodyCtx.binders.length;
+
+    const frame: LoopContext = {
+      loop,
+      ih,
+      measure: measureFn,
+      invariant: predicate,
+      components,
+      stateDepth: depth,
+    };
+    this.loopStack.push(frame);
+    let body: Term;
+    try {
+      body = this.elabIf(bodyCtx, this.loopHyps(bodyCtx, hyps, px, hinv), {
+        kind: "if",
+        cond: loop.test,
+        then: loop.body,
+        otherwise: loop.rest,
+        span: loop.span,
+      });
+    } finally {
+      this.loopStack.pop();
+    }
+
+    const step = K.lam(
+      "s",
+      stateType,
+      K.lam(
+        "px",
+        pxType,
+        K.lam("ih", ihType, K.lam(hinv.name, hinv.type, body)),
+      ),
+    );
+
+    // The init obligations (in the enclosing context) become `p0` and `hinv0`.
+    this.withHyps(hyps, () => this.certifySites(ctx, hyps, loop.initSites, opts));
+    const initial = loop.carried.map((carried) => exprTerm(ctx, carried.initial, opts));
+    const start = this.packTuple(ctx, components, initial, depth);
+    const nonneg = loop.initSites.find((site) => site.kind === "measure-nonneg");
+    const init = loop.initSites.find((site) => site.kind === "invariant-init");
+    const p0 = nonneg === undefined ? K.tt : this.proofAt(nonneg.id, depth) ?? K.tt;
+    const hinv0 = init === undefined ? K.tt : this.proofAt(init.id, depth) ?? K.tt;
+
+    const loopTerm = K.FixWf(0, stateType, predicate, measureFn, step, start, p0);
+    void bodyDepth;
+    return K.app(loopTerm, hinv0);
+  }
+
+  /** The hypotheses available in a loop body: the signature's, plus `px` and `hinv`. */
+  private loopHyps(ctx: Ctx, hyps: readonly Hyp[], px: Binder, hinv: Binder): Hyp[] {
+    const depth = ctx.binders.length;
+    return dedupeHyps([
+      ...hypsAt(hyps, depth),
+      ...this.signatureHyps(ctx),
+      {
+        term: this.binderTypeAt(ctx, px),
+        proof: K.varTerm(deBruijnIndex(ctx, px)),
+        depth,
+        origin: "measure",
+      },
+      {
+        term: this.binderTypeAt(ctx, hinv),
+        proof: K.varTerm(deBruijnIndex(ctx, hinv)),
+        depth,
+        origin: "invariant",
+      },
+    ]);
+  }
+
+  /** The carried-state components: name, kernel type and tuple path. */
+  private loopComponents(ctx: Ctx, loop: LoopIR): Component[] {
+    return loop.carried.map((carried, index) => ({
+      name: carried.name,
+      type: this.valueType(ctx, carried.type),
+      path: index === 0 ? [0] : [...Array(index).fill(1), 0],
+    }));
+  }
+
+  /** The kernel type of a value of `type`, in `ctx`. */
+  private valueType(ctx: Ctx, type: TypeIR): Term {
+    switch (type.kind) {
+      case "int":
+        return K.Int;
+      case "union":
+        return type.union!.sumType;
+      case "generic":
+        return this.resolvedTypeParam(ctx, type.typeParam!);
+      case "vec":
+        throw new ElaborateFailure("a loop cannot carry a vector: the extractor cannot name its length");
+      case "boolean":
+        throw new ElaborateFailure("`boolean` is only allowed as the type of a condition");
+    }
+  }
+
+  /** `Sigma (v0 : T0). Sigma (v1 : T1). … Unit` for the components. */
+  private tupleType(components: readonly Component[]): Term {
+    let out: Term = K.Unit;
+    for (let i = components.length - 1; i >= 0; i -= 1) {
+      out = K.sigma(components[i]!.name, components[i]!.type, out);
+    }
+    return out;
+  }
+
+  /**
+   * `⟨v0, ⟨v1, … ⟨vn-1, tt⟩⟩⟩`, each pair annotated with the `Sigma` type of the suffix.
+   * The component types are constant (a loop cannot carry a vector), so the annotations need
+   * no substitution.
+   */
+  private packTuple(ctx: Ctx, components: readonly Component[], values: readonly Term[], depth: number): Term {
+    if (values.length !== components.length) {
+      throw new ElaborateFailure("the state tuple and its component list disagree");
+    }
+    const lift = ctx.binders.length - depth;
+    const types: Term[] = [];
+    let suffix: Term = K.Unit;
+    for (let i = components.length - 1; i >= 0; i -= 1) {
+      const component = components[i]!;
+      suffix = K.sigma(component.name, lift === 0 ? component.type : shiftTerm(component.type, lift), suffix);
+      types[i] = suffix;
+    }
+    let out: Term = K.tt;
+    for (let i = components.length - 1; i >= 0; i -= 1) out = K.pair(types[i]!, values[i]!, out);
+    return out;
+  }
+
+  /** A `continue`: apply the loop's `ih` to the new state and the back-edge proofs. */
+  private elabContinue(
+    ctx: Ctx,
+    hyps: readonly Hyp[],
+    stmt: Extract<StmtIR, { kind: "continue" }>,
+  ): Term {
+    const frame = this.loopStack.find((entry) => entry.loop.id === stmt.loop.id);
+    if (frame === undefined) throw new ElaborateFailure("a `continue` outside the loop it belongs to");
+    const opts = this.optionsFor();
+    this.withHyps(hyps, () => this.certifySites(ctx, hyps, stmt.sites, opts));
+    const proofOf = (kind: ObligationKind): Term => {
+      const site = stmt.sites.find((candidate) => candidate.kind === kind);
+      if (site === undefined) throw new ElaborateFailure(`the back edge has no ${kind} obligation`);
+      const proof = this.proofAt(site.id, ctx.binders.length);
+      if (proof === undefined) throw new ElaborateFailure(`the ${kind} obligation of the back edge is missing`);
+      return proof;
+    };
+    const values = stmt.values.map((entry) => exprTerm(ctx, entry.value, opts));
+    const state = this.packTuple(ctx, frame.components, values, ctx.binders.length);
+    return K.appMany(K.varTerm(deBruijnIndex(ctx, frame.ih)), [
+      state,
+      proofOf("measure-nonneg"),
+      proofOf("measure-decrease"),
+      proofOf("invariant-preserve"),
+    ]);
+  }
+
+  /** Report the placeholder used before part B implemented recursion. */
+  private runRecursive(ctx: Ctx): ElaborationOutcome {
+    void ctx;
+    this.internal(
+      this.fn.nameSpan,
+      `\`${this.fn.name}\` uses recursion, which is not implemented yet`,
+    );
+    return this.finish("failed");
+  }
+
   // ---- statements ---------------------------------------------------------
 
   private elabStmts(ctx: Ctx, hyps: readonly Hyp[], stmts: readonly StmtIR[]): Term {
@@ -1579,9 +2147,28 @@ class Elaborator {
         case "local": {
           const depth = ctx.binders.length;
           const value = this.elabExpr(ctx, hyps, stmt.value);
-          const inner = pushed(ctx, stmt.binder);
-          const rest = this.elabStmts(inner, hypsAt(hyps, depth + 1), stmts.slice(i + 1));
-          return K.letTerm(stmt.binder.name, stmt.binder.type, value.term, rest);
+          const inner = this.pushExt(ctx, stmt.binder);
+          // A local whose value carries no proof argument is substituted at every use: it is
+          // still bound with a `let` (so the kernel term is unchanged, up to zeta), but a
+          // goal that mentions it by name mentions its value instead, which is what lets a
+          // `divFloorSpec` fact about `(lo + hi) / 2` line up with `let mid = …`.
+          const inlinable = !containsProofCarrier(stmt.value);
+          const binder = stmt.binder;
+          const term = value.term;
+          if (inlinable) {
+            this.inlineSlots.set(binder.id, (at) =>
+              at.binders.some((candidate) => candidate.id === binder.id)
+                ? shiftTerm(term, at.binders.length - depth)
+                : undefined,
+            );
+          }
+          let rest: Term;
+          try {
+            rest = this.elabStmts(inner, hypsAt(hyps, depth + 1), stmts.slice(i + 1));
+          } finally {
+            if (inlinable) this.inlineSlots.delete(binder.id);
+          }
+          return K.letTerm(stmt.binder.name, this.binderTypeAt(ctx, stmt.binder), value.term, rest);
         }
         case "return":
           return this.elabReturn(ctx, hyps, stmt);
@@ -1589,13 +2176,15 @@ class Elaborator {
           return this.elabIf(ctx, hyps, stmt);
         case "switch":
           return this.elabSwitch(ctx, hyps, stmt);
-        case "assign":
         case "loop":
+          return this.elabLoop(ctx, hyps, stmt.loop);
         case "continue":
+          return this.elabContinue(ctx, hyps, stmt);
+        case "assign":
           this.internal(
             stmt.span,
-            `\`${this.fn.name}\` uses ${stmt.kind === "loop" ? "a loop" : "a loop-carried assignment"}, ` +
-              `and loop elaboration is not implemented yet (milestone 7 part B)`,
+            `\`${this.fn.name}\` assigns to a variable that is neither a loop-carried variable nor a ` +
+              `fresh local; this is a gap in the extraction`,
           );
           return K.tt;
       }
@@ -1655,7 +2244,7 @@ class Elaborator {
       }
       const [a, b] = this.ifLeOperands(ctx, cond.expr, opts);
       const thenTerm = this.elabReturnValue(
-        pushed(ctx, cond.thenBinder),
+        this.pushExt(ctx, cond.thenBinder),
         [
           ...hypsAt(base, depth + 1),
           { term: shiftTerm(K.Le(a, b), 1), proof: K.varTerm(0), depth: depth + 1, origin: "condition" },
@@ -1664,7 +2253,7 @@ class Elaborator {
         site,
       );
       const elseTerm = this.elabReturnValue(
-        pushed(ctx, cond.elseBinder),
+        this.pushExt(ctx, cond.elseBinder),
         [
           ...hypsAt(base, depth + 1),
           { term: shiftTerm(K.Lt(b, a), 1), proof: K.varTerm(0), depth: depth + 1, origin: "condition" },
@@ -1784,8 +2373,7 @@ class Elaborator {
   /** The packed `Sigma` result of `ResultLayout`. */
   private packResult(ctx: Ctx, value: Term, postProof: Term, valueExpr: ExprIR): Term {
     const layout = this.fn.signature.result.layout;
-    const extra = ctx.binders.length - this.fn.signature.binders.length;
-    const sigmaType = shiftTerm(this.fn.signature.result.term, extra);
+    const sigmaType = this.resultTypeAt(ctx);
     switch (layout.shape) {
       case "int":
         return K.pair(sigmaType, value, postProof);
@@ -1829,8 +2417,8 @@ class Elaborator {
     }
 
     const [a, b] = this.ifLeOperands(ctx, cond.expr, this.optionsFor());
-    const thenCtx = pushed(ctx, cond.thenBinder);
-    const elseCtx = pushed(ctx, cond.elseBinder);
+    const thenCtx = this.pushExt(ctx, cond.thenBinder);
+    const elseCtx = this.pushExt(ctx, cond.elseBinder);
     const thenTerm = this.elabStmts(
       thenCtx,
       [
@@ -1879,7 +2467,7 @@ class Elaborator {
   // ---- case splits --------------------------------------------------------
 
   private resultTypeAt(ctx: Ctx): Term {
-    return shiftTerm(this.fn.signature.result.term, ctx.binders.length - this.fn.signature.binders.length);
+    return this.fromExtractor(ctx, this.fn.signature.result.term, this.fn.signature.binders.length);
   }
 
   /**
@@ -1918,7 +2506,7 @@ class Elaborator {
     }
 
     const build = (branch: CaseBranch): Term => {
-      let inner = pushed(ctx, branch.binder);
+      let inner = this.pushExt(ctx, branch.binder);
       let branchHyps: Hyp[] = [...hypsAt(hyps, depth + 1)];
       const lambdas: { name: string; domain: Term }[] = [];
       for (let k = 0; k < conditional.length; k += 1) {

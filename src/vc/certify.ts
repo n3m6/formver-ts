@@ -200,10 +200,14 @@ function certifyObligation(env: K.Env, obligation: Obligation, opts: CertifyOpti
 function buildContext(env: K.Env, domains: readonly K.Term[] | undefined): K.Ctx {
   if (domains === undefined) return K.emptyCtx(env);
   const types: K.Value[] = [];
-  const values: K.Value[] = [];
+  // Every iteration hands `evalTerm` a *fresh* array: a `Pi`/`Sigma`/`Lam` value created
+  // while evaluating a domain captures the environment array by reference, so appending to
+  // the array in place would later change what a closure created here refers to — a
+  // dependent domain (a `Vec` element guard, say) would then read the wrong variable.
+  let values: K.Value[] = [];
   for (let level = 0; level < domains.length; level += 1) {
     types.push(K.evalTerm(env, domains[level]!, values));
-    values.push(K.vvar(level));
+    values = [...values, K.vvar(level)];
   }
   return { env, types, values };
 }

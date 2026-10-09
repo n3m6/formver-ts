@@ -575,6 +575,13 @@ export interface TermOptions {
   /** Proof terms for obligation sites, keyed by site id (milestone 7 fills these in). */
   readonly proofs?: ReadonlyMap<number, Term>;
   /**
+   * Milestone 7 hook: the proof of `siteId` *as used at `depth` binders*.  A site's proof is
+   * built in the context of the site, so using it deeper (typically the `index` proof a later
+   * `elems_a i p` fact applies) requires weakening it; a plain `proofs` map cannot say that.
+   * Consulted before `proofs`.
+   */
+  readonly proofAt?: (siteId: number, depth: number) => Term | undefined;
+  /**
    * Milestone 7 hook: a node whose kernel term needs more than this module can build from
    * the IR alone.  `call` needs the callee's whole binder telescope (argument `InRange`
    * proofs, bounds for the vector arguments, the callee's preconditions) and `append` needs
@@ -583,6 +590,15 @@ export interface TermOptions {
    * definitions this module builds itself, are never overridden).
    */
   readonly override?: (ctx: Ctx, e: ExprIR, opts: TermOptions) => Term | undefined;
+  /**
+   * Milestone 7 hook: a `binder` slot whose *variable* should be replaced by its value.
+   * A `let`-bound local whose value carries no proof argument is substituted at every use,
+   * so a fact about the value (for example `divFloorSpec` about the numerator of a `let mid
+   * = Math.floor(…)`) lines up with a goal that mentions the local by name.  The hook is a
+   * function of the context because the replacement may mention a variable of the current
+   * context (a loop's state tuple, a recursive function's argument tuple).
+   */
+  readonly inlineSlots?: (ctx: Ctx, slot: Slot) => Term | undefined;
 }
 
 /** The override hook, when the options carry one. */
@@ -597,9 +613,12 @@ export function project(term: Term, path: readonly number[]): Term {
   return out;
 }
 
-function proofFor(e: ExprIR, opts: TermOptions | undefined): Term {
+function proofFor(ctx: Ctx, e: ExprIR, opts: TermOptions | undefined): Term {
   const id = e.siteId;
-  const proof = id === undefined ? undefined : opts?.proofs?.get(id);
+  const proof =
+    id === undefined
+      ? undefined
+      : opts?.proofAt?.(id, ctx.binders.length) ?? opts?.proofs?.get(id);
   if (proof === undefined) {
     throw new ExtractError(
       `the term for \`${e.kind}\` needs the proof of obligation site #${id ?? "?"}; pass it in TermOptions.proofs`,
@@ -615,8 +634,11 @@ function applyPath(term: Term, path: readonly number[] | undefined): Term {
 /** The kernel term a slot denotes, in the context `ctx`. */
 export function slotTerm(ctx: Ctx, slot: Slot, opts?: TermOptions): Term {
   switch (slot.kind) {
-    case "binder":
+    case "binder": {
+      const inlined = opts?.inlineSlots?.(ctx, slot);
+      if (inlined !== undefined) return inlined;
       return { tag: "Var", index: deBruijnIndex(ctx, slot.binder) };
+    }
     case "state":
       return project({ tag: "Var", index: deBruijnIndex(ctx, slot.state) }, slot.path);
     case "payload":
@@ -814,7 +836,7 @@ export function exprTerm(ctx: Ctx, e: ExprIR, opts?: TermOptions): Term {
         exprTerm(ctx, vec.vecLength!, opts),
         exprTerm(ctx, vec, opts),
         exprTerm(ctx, e.args[1]!, opts),
-        proofFor(e, opts),
+        proofFor(ctx, e, opts),
       );
     }
     case "slice": {
@@ -825,7 +847,7 @@ export function exprTerm(ctx: Ctx, e: ExprIR, opts?: TermOptions): Term {
         exprTerm(ctx, vec, opts),
         exprTerm(ctx, e.args[1]!, opts),
         exprTerm(ctx, e.args[2]!, opts),
-        proofFor(e, opts),
+        proofFor(ctx, e, opts),
       );
     }
     case "append": {
@@ -837,7 +859,7 @@ export function exprTerm(ctx: Ctx, e: ExprIR, opts?: TermOptions): Term {
       const custom = overrideTerm(ctx, e, opts);
       if (custom !== undefined) return custom;
       const elem = elemKernelType(ctx, e.type.elem!);
-      const proof = proofFor(e, opts);
+      const proof = proofFor(ctx, e, opts);
       const first = e.args[0];
       if (first === undefined) throw new ExtractError("an array literal needs at least one spread part");
       let length: Term = exprTerm(ctx, first.vecLength!, opts);

@@ -37,6 +37,7 @@ const PASS_FILES = [
   "examples/pass/take.ts",
   "examples/pass/shape.ts",
   "examples/pass/useClamp.ts",
+  "examples/pass/binarySearch.ts",
 ] as const;
 
 // ---------------------------------------------------------------------------
@@ -375,22 +376,17 @@ describe("imported specs", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Part B is not implemented yet: loops and recursion must not crash the driver
+// Recursion is part B's second half; until it lands the driver must not crash
 // ---------------------------------------------------------------------------
 
-describe("loops and recursion (part B)", () => {
-  for (const [file, what] of [
-    ["examples/pass/binarySearch.ts", "loop"],
-    ["examples/pass/sumTo.ts", "recursion"],
-    ["examples/fail/noDecrease.ts", "recursion"],
-  ] as const) {
-    test(`${file} is failed with an \`internal\` diagnostic naming ${what}`, () => {
+describe("recursion (part B)", () => {
+  for (const file of ["examples/pass/sumTo.ts", "examples/fail/noDecrease.ts"] as const) {
+    test(`${file} is failed with an \`internal\` diagnostic naming recursion`, () => {
       const result = run(file);
       expect(result.ok).toBe(false);
       const diagnostic = result.diagnostics.find((d) => d.kind === "internal")!;
       expect(diagnostic).toBeDefined();
-      expect(diagnostic.message).toContain(what);
-      expect(diagnostic.message).toContain("milestone 7 part B");
+      expect(diagnostic.message).toContain("recursion");
       expect(result.functions.every((fn) => fn.status === "failed")).toBe(true);
     });
   }
