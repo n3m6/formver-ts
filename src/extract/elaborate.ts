@@ -186,6 +186,20 @@ function arrowsTo(propositions: readonly Term[], rest: Term): Term {
   return out;
 }
 
+/**
+ * `(h0 : p0) -> (h1 : p1) -> … -> rest`, where every proposition and `rest` are given in the
+ * *same* context: `pᵢ` is lifted past the `i` binders before it and `rest` past all of them.
+ * (`arrowsTo` instead expects propositions that are already in the scope of the earlier
+ * binders.)
+ */
+function arrowStack(propositions: readonly Term[], rest: Term): Term {
+  let out = shiftTerm(rest, propositions.length);
+  for (let i = propositions.length - 1; i >= 0; i -= 1) {
+    out = K.pi(`h${i}`, shiftTerm(propositions[i]!, i), out);
+  }
+  return out;
+}
+
 /** `body[Var 0 := arg]`, with `body` under one binder more than `arg`. */
 function instantiateTop(body: Term, arg: Term): Term {
   return walk(body, 0);
@@ -241,8 +255,10 @@ function instantiateTop(body: Term, arg: Term): Term {
  */
 function containsProofCarrier(e: ExprIR): boolean {
   if (e.kind === "index" || e.kind === "slice" || e.kind === "append") return true;
-  // A prelude call is a kernel definition (`divFloor`, `ifLe`): it needs no obligation proof.
-  if (e.kind === "call" && e.callee?.kind !== "prelude") return true;
+  // A call is *bound* first (`elabExpr`), so its term is a plain variable by the time a
+  // return value or a fact mentions it; a prelude call (`divFloor`, `ifLe`) is a kernel
+  // definition and needs no obligation proof at all.
+  if (e.kind === "call") return false;
   if (e.args.some(containsProofCarrier)) return true;
   if (e.vecLength !== undefined && containsProofCarrier(e.vecLength)) return true;
   if (e.cond !== undefined) {
@@ -448,11 +464,17 @@ function hypsAt(hyps: readonly Hyp[], depth: number): Hyp[] {
   return hyps.map((hyp) => hypAt(hyp, depth));
 }
 
+/**
+ * Drop repeated hypotheses.  The key is the *proposition* (and the depth), not the proof: a
+ * fact the walk derived and the same fact the extractor recorded have different proofs but
+ * carry the same row, and every extra row is another integer variable in the certificate
+ * search.
+ */
 function dedupeHyps(hyps: readonly Hyp[]): Hyp[] {
   const seen = new Set<string>();
   const out: Hyp[] = [];
   for (const hyp of hyps) {
-    const key = `${hyp.depth}|${K.formatTerm(hyp.term)}|${K.formatTerm(hyp.proof)}`;
+    const key = `${hyp.depth}|${K.formatTerm(hyp.term)}`;
     if (seen.has(key)) continue;
     seen.add(key);
     out.push(hyp);
@@ -460,10 +482,51 @@ function dedupeHyps(hyps: readonly Hyp[]): Hyp[] {
   return out;
 }
 
-function conjunctionProjection(index: number): number[] {
-  const path: number[] = [];
-  for (let i = 0; i < index; i += 1) path.push(1, 0);
-  return path;
+/**
+ * Every call node of an expression that builds a term carrying proof arguments, in
+ * evaluation order (a call's arguments before the call itself), so that binding them one by
+ * one lets a later call's arguments mention the earlier bound variables.
+ */
+function callNodesIn(e: ExprIR): ExprIR[] {
+  const out: ExprIR[] = [];
+  const visit = (node: ExprIR): void => {
+    for (const arg of node.args) visit(arg);
+    if (node.vecLength !== undefined) visit(node.vecLength);
+    if (node.cond !== undefined) {
+      visit(node.cond.expr);
+      if (node.cond.thenExpr !== undefined) visit(node.cond.thenExpr);
+      if (node.cond.elseExpr !== undefined) visit(node.cond.elseExpr);
+    }
+    if (node.kind === "call" && node.callee !== undefined && node.callee.kind !== "prelude") out.push(node);
+  };
+  visit(e);
+  return out;
+}
+
+/**
+ * The identity of a call *site*.  The extractor copies a call node when it records a fact
+ * about its result (`instantiate`/`substituteExpr` build fresh nodes), so binding by object
+ * identity would miss the copy; the source span identifies the call unambiguously.
+ */
+function callSiteKey(e: ExprIR): string {
+  return `${e.span.line}:${e.span.col}:${e.span.offset}:${e.span.endOffset ?? ""}|${e.callee?.name ?? ""}`;
+}
+
+/** `[1] * index + [0]`: where component `index` of a nested `Sigma` tuple lives. */
+function componentPath(index: number): number[] {
+  return index === 0 ? [0] : [...Array(index).fill(1), 0];
+}
+
+/**
+ * The `fst`/`snd` path of the `index`-th component of a right-nested `And` of `count` parts
+ * (`andAll`/`conjoin` nest as `And p0 (And p1 …)`).  A single part *is* the conjunction, so
+ * its path is empty — which is what a one-component `@post` or `@pre` list needs.
+ */
+function conjunctionProjection(index: number, count: number): number[] {
+  if (count <= 1) return [];
+  // The last component is the innermost `snd`: `And p0 (And p1 p2)` reaches `p2` by `snd`
+  // twice, and every earlier component by `snd`s and an `fst`.
+  return index === count - 1 ? Array(count - 1).fill(1) : [...Array(index).fill(1), 0];
 }
 
 // ---------------------------------------------------------------------------
@@ -494,17 +557,32 @@ interface LoopContext {
   readonly invariant: Term;
   /** The carried variables, in tuple order. */
   readonly components: readonly Component[];
+  /** The tuple telescope, for the back edge's new state. */
+  readonly spec: TupleSpec;
   /** The elaborator's context depth where the loop's state tuple lives. */
   readonly stateDepth: number;
 }
 
-/** One component of a tuple: the name and type for the `Sigma` annotations, and the path. */
+/** One component of a tuple (`A`): the name for the `Sigma` annotations and its path. */
 interface Component {
   readonly name: string;
-  /** The kernel type of the component (a closed-relative-to-`ctx` term). */
+  /** The component's type, written at the depth `TupleSpec.typeAt` expects. */
   readonly type: Term;
   /** Its path from the tuple root: `[1] * i + [0]`. */
   readonly path: readonly number[];
+}
+
+/**
+ * A tuple telescope and the rule that re-bases a component type under the telescope's own
+ * binders.  A loop's component types live in the enclosing context (only a shift is needed);
+ * a recursive function's are signature binder types, whose references to earlier parameters
+ * become telescope variables.  Both `A` and every `Pair` annotation are built from `typeAt`,
+ * which is what keeps them in step for a *dependent* component (`Vec T n_a`, `InRange n`).
+ */
+interface TupleSpec {
+  readonly components: readonly Component[];
+  /** `typeAt(ctx, bound, i)`: component `i`'s type in the scope `[ctx, v_0 … v_{bound-1}]`. */
+  readonly typeAt: (ctx: Ctx, bound: number, index: number) => Term;
 }
 
 /** What the body of a recursive function needs to build a recursive call. */
@@ -515,12 +593,10 @@ interface RecursionContext {
   readonly ih: Binder;
   /** The measure function `m : A -> Int`, in the enclosing context. */
   readonly measure: Term;
-  /** The measure as a term of the *body* context (`m x`), for the entry obligation. */
-  readonly components: readonly Component[];
-  /** The argument tuple type `A`, in the enclosing context. */
-  readonly tupleType: Term;
-  /** The `@pre` binders absorbed by `B`, in order. */
-  readonly preBinders: readonly Binder[];
+  /** The signature binders the tuple holds, in component order (type parameters excluded). */
+  readonly binders: readonly Binder[];
+  /** The tuple telescope. */
+  readonly spec: TupleSpec;
 }
 
 class Elaborator {
@@ -574,6 +650,16 @@ class Elaborator {
    * it is still a real variable in the kernel context.
    */
   private readonly inlineExt = new Map<number, (ctx: Ctx) => Term | undefined>();
+  /**
+   * Proof-carrying calls this statement has bound with a `let`, so that a goal or a fact
+   * mentions the *variable* rather than a term full of certificates.  Without this, the atom
+   * of a recursive call's value carries the proof arguments of the call, which the SMT
+   * encoding cannot read (and which makes a `Sigma` look dependent when it is not).
+   */
+  private readonly boundCalls = new Map<
+    string,
+    { readonly binder: Binder; readonly depth: number; readonly applied: Map<number, Term> }
+  >();
   /** The loop whose body is being elaborated (a `continue` needs its `ih`). */
   private readonly loopStack: LoopContext[] = [];
   /** A recursive function's argument tuple (`x`), while its body is elaborated. */
@@ -593,13 +679,13 @@ class Elaborator {
     this.fn.signature.binders.forEach((binder, position) => this.extOf.set(binder.id, position));
     const ctx: Ctx = { binders: this.fn.signature.binders, facts: [], narrowings: [], ids: new Ids() };
 
-    if (this.fn.recursive) return this.runRecursive(ctx);
-
     const hyps = this.signatureHyps(ctx);
 
     let body: Term;
     try {
-      body = this.elabStmts(ctx, hyps, this.fn.body);
+      // A recursive function's body is the `step` of a `fixWf` over its own parameters; a
+      // straight-line one is the body itself.
+      body = this.fn.recursive ? this.elabRecursive(ctx, hyps) : this.elabStmts(ctx, hyps, this.fn.body);
       this.sweep(ctx, hyps);
     } catch (error) {
       this.internal(
@@ -608,7 +694,11 @@ class Elaborator {
       );
       return this.finish("failed");
     }
+    return this.admit(body);
+  }
 
+  /** Wrap the body in the signature's lambda telescope and deliver the verdict. */
+  private admit(body: Term): ElaborationOutcome {
     let term = body;
     for (let i = this.fn.signature.binders.length - 1; i >= 0; i -= 1) {
       const binder = this.fn.signature.binders[i]!;
@@ -624,7 +714,8 @@ class Elaborator {
       if (smtOnly) return this.finish("smt-only", term);
       this.internal(
         this.fn.nameSpan,
-        `the kernel rejected the elaborated term of \`${this.fn.name}\`: ${K.formatKernelError(checked.error)}`,
+        `the kernel rejected the elaborated term of \`${this.fn.name}\`: ${K.formatKernelError(checked.error)}` +
+          (checked.error.term === undefined ? "" : ` || at ${K.formatTerm(checked.error.term)}`),
       );
       return this.finish("failed", term);
     }
@@ -697,6 +788,17 @@ class Elaborator {
     return shiftTerm(entry.term, depth - entry.depth);
   }
 
+  /** The proof of one of a recursive call's measure obligations, weakened to `depth`. */
+  private selfCallProof(e: ExprIR, kind: ObligationKind, depth: number): Term {
+    const site = e.sites.find((candidate) => candidate.kind === kind);
+    if (site === undefined) throw new ElaborateFailure(`a recursive call has no \`${kind}\` obligation`);
+    const proof = this.proofAt(site.id, depth);
+    if (proof === undefined) {
+      throw new ElaborateFailure(`the ${kind} obligation of this recursive call was not certified`);
+    }
+    return proof;
+  }
+
   /** Record a site's proof, keeping the shallowest one (it can be weakened to any deeper use). */
   private storeProof(siteId: number, term: Term, depth: number): void {
     const existing = this.proofs.get(siteId);
@@ -724,7 +826,22 @@ class Elaborator {
       const position = this.extOf.get(binder.id);
       if (position !== undefined) max = Math.max(max, position);
     }
+    // A binder that is *inlined* (a recursive function's parameter) still occupies its
+    // extraction position, so the next extractor binder must be numbered after it.
+    for (const position of this.inlineExt.keys()) max = Math.max(max, position);
     return max + 1;
+  }
+
+  /**
+   * The binder an `ifLe` branch introduces.  Its domain is the *kernel's* (`Le a b` in the
+   * yes branch, `Lt b a` in the no branch); the extractor's stored type renders the source
+   * condition instead (`Eq a b`, `Not (Eq a b)`, …), and a hypothesis whose proof does not
+   * have the proposition it is stated with makes `certify` reconstruct an equality row it
+   * cannot prove.  The copy keeps the extractor's id, so slots still resolve.
+   */
+  private branchBinder(binder: Binder, type: Term): Binder {
+    this.ownType.add(binder.id);
+    return { ...binder, type };
   }
 
   /** Push an *extractor* binder: it takes the next extraction position. */
@@ -806,11 +923,16 @@ class Elaborator {
               }
             }
           }
-          for (const arg of term.args) visit(arg);
+          // Only the *value* arguments: a proof argument (the bounds proof of `get`, the
+          // refutation of `byContra`, a whole `Farkas`) lives under binders of its own, so a
+          // division found there would be stated about the wrong variables.
+          const irrelevant = K.irrelevantOf(term.op) ?? [];
+          term.args.forEach((arg, index) => {
+            if (!irrelevant.includes(index)) visit(arg);
+          });
           return;
         }
         case "Pi":
-        case "Lam":
           visit(term.domain);
           visit(term.body);
           return;
@@ -818,26 +940,9 @@ class Elaborator {
           visit(term.first);
           visit(term.second);
           return;
-        case "Let":
-          visit(term.type);
-          visit(term.value);
-          visit(term.body);
-          return;
         case "App":
           visit(term.fn);
           visit(term.arg);
-          return;
-        case "Pair":
-          visit(term.sigma);
-          visit(term.first);
-          visit(term.second);
-          return;
-        case "Fst":
-        case "Snd":
-          visit(term.pair);
-          return;
-        case "Farkas":
-          for (const hyp of term.hyps) visit(hyp);
           return;
         default:
           return;
@@ -1005,7 +1110,7 @@ class Elaborator {
       // hypothesis and the proof in step even where the extractor's rendering differs (an
       // `if (a === b)` branch, for example, binds `Le a b`, not `Eq Int a b`).
       const binder = fact.binder;
-      if (ctx.binders.some((candidate) => candidate.id === binder.id)) {
+      if (!this.inlineSlots.has(binder.id) && ctx.binders.some((candidate) => candidate.id === binder.id)) {
         return {
           term: this.binderTypeAt(ctx, binder),
           proof: K.varTerm(deBruijnIndex(ctx, binder)),
@@ -1184,6 +1289,18 @@ class Elaborator {
     opts: TermOptions,
   ): { depth: number; packed: Term; packedType?: Term; applied: Map<number, Term> } {
     const depth = ctx.binders.length;
+    const bound = this.boundCalls.get(callSiteKey(e));
+    if (bound !== undefined && bound.depth <= depth && ctx.binders.some((b) => b.id === bound.binder.id)) {
+      const shift = depth - bound.depth;
+      const applied = new Map<number, Term>();
+      for (const [id, term] of bound.applied) applied.set(id, shiftTerm(term, shift));
+      return {
+        depth,
+        packed: K.varTerm(deBruijnIndex(ctx, bound.binder)),
+        packedType: shiftTerm(bound.binder.type, shift),
+        applied,
+      };
+    }
     const cached = this.callCache.get(e);
     if (cached !== undefined && cached.depth === depth) return cached;
     const callee = e.callee;
@@ -1220,6 +1337,8 @@ class Elaborator {
     const typeArgs = this.typeArguments(ctx, signature, e.args);
     const applied = new Map<number, Term>();
     const ordered: Term[] = [];
+    /** The callee's non-type-parameter binders, in order: a recursive call's argument tuple. */
+    const tupleValues: Term[] = [];
     let preIndex = 0;
     let previousParam: Binder | undefined;
     for (let i = 0; i < signature.binders.length; i += 1) {
@@ -1227,6 +1346,7 @@ class Elaborator {
       const push = (term: Term): void => {
         applied.set(binder.id, term);
         ordered.push(term);
+        if (binder.role !== "type-param") tupleValues.push(term);
       };
       switch (binder.role) {
         case "type-param": {
@@ -1278,9 +1398,22 @@ class Elaborator {
           throw new ElaborateFailure(`unsupported binder role \`${binder.role}\` in \`${callee.name}\``);
       }
     }
+    // A recursive call is an application of the induction hypothesis to the new argument
+    // tuple, the two measure proofs and the callee's preconditions — the *callee* is `ih`.
+    let packed: Term;
+    if (callee.kind === "self") {
+      const frame = this.recursion;
+      if (frame === null) throw new ElaborateFailure("a recursive call outside a recursive function");
+      const state = this.packTuple(frame.spec, ctx, tupleValues);
+      const nonneg = this.selfCallProof(e, "measure-nonneg", depth);
+      const decrease = this.selfCallProof(e, "measure-decrease", depth);
+      packed = K.appMany(K.varTerm(deBruijnIndex(ctx, frame.ih)), [state, nonneg, decrease, ...preProofs]);
+    } else {
+      packed = K.appMany(K.constTerm(callee.name), ordered);
+    }
     const info: { depth: number; packed: Term; packedType?: Term; applied: Map<number, Term> } = {
       depth,
-      packed: K.appMany(K.constTerm(callee.name), ordered),
+      packed,
       applied,
     };
     try {
@@ -1327,7 +1460,12 @@ class Elaborator {
       } catch {
         continue; // a postcondition this call site cannot express is simply not assumed
       }
-      out.push({ term, proof: project(conjunction, conjunctionProjection(i)), depth, origin: "call-result" });
+      out.push({
+        term,
+        proof: project(conjunction, conjunctionProjection(i, signature.result.posts.length)),
+        depth,
+        origin: "call-result",
+      });
     }
     return out;
   }
@@ -1383,7 +1521,7 @@ class Elaborator {
     if (proof === undefined) throw new ElaborateFailure("the pre-call obligation of this call was not certified");
     const out: Term[] = [];
     for (let i = 0; i < count; i += 1) {
-      const path = conjunctionProjection(i);
+      const path = conjunctionProjection(i, count);
       out.push(path.length === 0 ? proof : project(proof, path));
     }
     return out;
@@ -1609,8 +1747,10 @@ class Elaborator {
     }
 
     const [a, b] = this.ifLeOperands(ctx, cond.expr, opts);
-    const thenCtx = this.pushExt(ctx, cond.thenBinder);
-    const elseCtx = this.pushExt(ctx, cond.elseBinder);
+    const thenBinder = this.branchBinder(cond.thenBinder, K.Le(a, b));
+    const elseBinder = this.branchBinder(cond.elseBinder, K.Lt(b, a));
+    const thenCtx = this.pushExt(ctx, thenBinder);
+    const elseCtx = this.pushExt(ctx, elseBinder);
     if (cond.thenExpr !== undefined) {
       this.prepare(
         thenCtx,
@@ -1780,13 +1920,14 @@ class Elaborator {
       }
     }
 
+    const kept = hypotheses;
     const obligation: Obligation = {
       id: `${this.fn.name}#${site.id}`,
       kind: site.kind,
       span: site.span,
       context: this.contextTypes(ctx),
-      hypotheses: hypotheses.map((hyp) => hyp.term),
-      proofs: hypotheses.map((hyp) => hyp.proof),
+      hypotheses: kept.map((hyp) => hyp.term),
+      proofs: kept.map((hyp) => hyp.proof),
       goal,
       atomNames: this.atomNamesFor(ctx),
     };
@@ -1794,6 +1935,7 @@ class Elaborator {
     const outcome = this.withHyps(hypotheses, () =>
       certify(this.env, obligation, { timeoutMs: this.options.timeoutMs }),
     );
+
     if (outcome.status === "certified" && outcome.proof !== undefined) {
       return { status: "certified", proof: outcome.proof };
     }
@@ -1923,8 +2065,8 @@ class Elaborator {
     const opts = this.optionsFor();
     const depth = ctx.binders.length;
 
-    const components = this.loopComponents(ctx, loop);
-    const stateType = this.tupleType(components);
+    const spec = this.loopSpec(ctx, loop);
+    const stateType = this.tupleType(spec, ctx);
     const state: Binder = { ...loop.state, type: stateType };
     this.ownType.add(state.id);
     const stateCtx = this.pushExt(ctx, state);
@@ -1977,7 +2119,8 @@ class Elaborator {
       ih,
       measure: measureFn,
       invariant: predicate,
-      components,
+      components: spec.components,
+      spec,
       stateDepth: depth,
     };
     this.loopStack.push(frame);
@@ -2007,7 +2150,7 @@ class Elaborator {
     // The init obligations (in the enclosing context) become `p0` and `hinv0`.
     this.withHyps(hyps, () => this.certifySites(ctx, hyps, loop.initSites, opts));
     const initial = loop.carried.map((carried) => exprTerm(ctx, carried.initial, opts));
-    const start = this.packTuple(ctx, components, initial, depth);
+    const start = this.packTuple(spec, ctx, initial);
     const nonneg = loop.initSites.find((site) => site.kind === "measure-nonneg");
     const init = loop.initSites.find((site) => site.kind === "invariant-init");
     const p0 = nonneg === undefined ? K.tt : this.proofAt(nonneg.id, depth) ?? K.tt;
@@ -2040,12 +2183,18 @@ class Elaborator {
   }
 
   /** The carried-state components: name, kernel type and tuple path. */
-  private loopComponents(ctx: Ctx, loop: LoopIR): Component[] {
-    return loop.carried.map((carried, index) => ({
+  private loopSpec(ctx: Ctx, loop: LoopIR): TupleSpec {
+    const components: Component[] = loop.carried.map((carried, index) => ({
       name: carried.name,
       type: this.valueType(ctx, carried.type),
-      path: index === 0 ? [0] : [...Array(index).fill(1), 0],
+      path: componentPath(index),
     }));
+    const typeDepth = ctx.binders.length;
+    return {
+      components,
+      typeAt: (at, bound, index) =>
+        shiftTerm(components[index]!.type, bound + (at.binders.length - typeDepth)),
+    };
   }
 
   /** The kernel type of a value of `type`, in `ctx`. */
@@ -2064,34 +2213,49 @@ class Elaborator {
     }
   }
 
-  /** `Sigma (v0 : T0). Sigma (v1 : T1). … Unit` for the components. */
-  private tupleType(components: readonly Component[]): Term {
+  /** The tuple type `A` itself: `Sigma (v0 : T0). Sigma (v1 : T1). … Unit`. */
+  private tupleType(spec: TupleSpec, ctx: Ctx): Term {
+    return this.tupleSuffix(spec, ctx, 0);
+  }
+
+  /**
+   * `Sigma (v_i : T_i). … Unit`, written in the scope `[ctx, v_0 … v_{i-1}]` — the type of
+   * the sub-tuple from component `i` on.
+   */
+  private tupleSuffix(spec: TupleSpec, ctx: Ctx, from: number): Term {
     let out: Term = K.Unit;
-    for (let i = components.length - 1; i >= 0; i -= 1) {
-      out = K.sigma(components[i]!.name, components[i]!.type, out);
+    for (let i = spec.components.length - 1; i >= from; i -= 1) {
+      const component = spec.components[i]!;
+      out = K.sigma(component.name, spec.typeAt(ctx, i, i), out);
     }
     return out;
   }
 
   /**
-   * `⟨v0, ⟨v1, … ⟨vn-1, tt⟩⟩⟩`, each pair annotated with the `Sigma` type of the suffix.
-   * The component types are constant (a loop cannot carry a vector), so the annotations need
-   * no substitution.
+   * `⟨v0, ⟨v1, … ⟨vn-1, tt⟩⟩⟩ : A`, each pair annotated with the `Sigma` type of the suffix
+   * it starts.  The annotation is the suffix *instantiated* with the preceding component
+   * values — built as a beta-redex `(λ v_0 … v_{i-1}. Σ_i) v_0 … v_{i-1}` so that a dependent
+   * component type (`InRange n`, `Vec T n_a`) is instantiated by the kernel itself.
    */
-  private packTuple(ctx: Ctx, components: readonly Component[], values: readonly Term[], depth: number): Term {
-    if (values.length !== components.length) {
+  private packTuple(spec: TupleSpec, ctx: Ctx, values: readonly Term[]): Term {
+    if (values.length !== spec.components.length) {
       throw new ElaborateFailure("the state tuple and its component list disagree");
     }
-    const lift = ctx.binders.length - depth;
-    const types: Term[] = [];
-    let suffix: Term = K.Unit;
-    for (let i = components.length - 1; i >= 0; i -= 1) {
-      const component = components[i]!;
-      suffix = K.sigma(component.name, lift === 0 ? component.type : shiftTerm(component.type, lift), suffix);
-      types[i] = suffix;
-    }
     let out: Term = K.tt;
-    for (let i = components.length - 1; i >= 0; i -= 1) out = K.pair(types[i]!, values[i]!, out);
+    for (let i = values.length - 1; i >= 0; i -= 1) {
+      const binder = this.suffixLambda(spec, ctx, i);
+      out = K.pair(K.appMany(binder, values.slice(0, i) as Term[]), values[i]!, out);
+    }
+    return out;
+  }
+
+  /** `λ v_0 … v_{i-1}. Σ_i`: the suffix type as a function of the components before it. */
+  private suffixLambda(spec: TupleSpec, ctx: Ctx, from: number): Term {
+    let out: Term = this.tupleSuffix(spec, ctx, from);
+    for (let i = from - 1; i >= 0; i -= 1) {
+      const component = spec.components[i]!;
+      out = K.lam(component.name, spec.typeAt(ctx, i, i), out);
+    }
     return out;
   }
 
@@ -2113,7 +2277,7 @@ class Elaborator {
       return proof;
     };
     const values = stmt.values.map((entry) => exprTerm(ctx, entry.value, opts));
-    const state = this.packTuple(ctx, frame.components, values, ctx.binders.length);
+    const state = this.packTuple(frame.spec, ctx, values);
     return K.appMany(K.varTerm(deBruijnIndex(ctx, frame.ih)), [
       state,
       proofOf("measure-nonneg"),
@@ -2122,14 +2286,276 @@ class Elaborator {
     ]);
   }
 
-  /** Report the placeholder used before part B implemented recursion. */
-  private runRecursive(ctx: Ctx): ElaborationOutcome {
+  // ---- recursive functions ------------------------------------------------
+
+  /**
+   * A recursive function as a `fixWf` over the *function's own parameters*:
+   *
+   * ```text
+   * A     = Sigma (n : Int). Sigma (r_n : InRange n). Sigma (pre : …). … Unit
+   * B     = fun (y : A) => pre_1(y) -> … -> Result(y)
+   * m     = fun (x : A) => <@decreases>
+   * step  = fun (x : A) (px : Le 0 (m x)) (ih : (y : A) -> Le 0 (m y) -> Lt (m y) (m x) -> B y)
+   *             (pre_1 : …) => body
+   * f     = fun (n : Int) (r_n : …) (pre : …) => fixWf A B m step x0 p0 pre
+   * ```
+   *
+   * `B` absorbs the function's preconditions, so a recursive call is `ih x' p↧ p< pre'`: the
+   * call site's `pre-call` obligation proves the preconditions of the *callee* at the
+   * arguments, and the two measure sites prove the decrease.  The body is elaborated in a
+   * context where every parameter (and every proof the signature introduced) stands for the
+   * matching component of `x`, which is what makes `m x` and the call sites line up.
+   */
+  private elabRecursive(ctx: Ctx, hyps: readonly Hyp[]): Term {
+    const opts = this.optionsFor();
+    const measureExpr = this.fn.measure;
+    if (measureExpr === undefined) {
+      throw new ElaborateFailure("a recursive function needs a `@decreases` measure");
+    }
+    const binders = this.fn.signature.binders;
+    const typeParams = binders.filter((binder) => binder.role === "type-param");
+    const components = binders.filter((binder) => binder.role !== "type-param");
+    if (binders.slice(0, typeParams.length).some((binder) => binder.role !== "type-param")) {
+      throw new ElaborateFailure("the extractor emitted a type parameter after a value binder");
+    }
+    const typeParamCtx: Ctx = { ...ctx, binders: binders.slice(0, typeParams.length) };
+    const spec = this.recursionSpec(ctx, binders, components);
+    const tupleType = this.tupleType(spec, ctx);
+
+    const tuple: Binder = { id: freshId(), name: "x", role: "local", type: tupleType };
+    const xCtx = pushed(ctx, tuple);
+    const restore = this.installProjections(tuple, components);
+    try {
+      // m x, and the measure-nonneg hypothesis the step receives.
+      const measure = K.lam(
+        "x",
+        tupleType,
+        this.withHyps(hypsAt(hyps, xCtx.binders.length), () => exprTerm(xCtx, measureExpr, opts)),
+      );
+      const pxType = K.Le(K.intLit(0n), K.app(shiftTerm(measure, 1), K.varTerm(0)));
+      const px: Binder = { id: freshId(), name: "px", role: "loop-measure-nonneg", type: pxType };
+      const measureCtx = pushed(xCtx, px);
+
+      // B = fun (y : A) => pre_1(y) -> … -> Result(y).
+      const y: Binder = { id: freshId(), name: "y", role: "local", type: tupleType };
+      const yCtx = pushed(typeParamCtx, y);
+      const restoreY = this.installProjections(y, components);
+      let preTerms: Term[];
+      let resultType: Term;
+      try {
+        preTerms = this.fn.signature.preconditions.map((fact) => exprTerm(yCtx, fact.prop, opts));
+        resultType = this.resultTypeAt(yCtx);
+      } finally {
+        restoreY();
+      }
+      const predicate = K.lam("y", tupleType, arrowStack(preTerms, resultType));
+
+      const ihType = K.pi(
+        "y",
+        shiftTerm(tupleType, 2),
+        K.pi(
+          "py",
+          K.Le(K.intLit(0n), K.app(shiftTerm(measure, 3), K.varTerm(0))),
+          K.pi(
+            "pd",
+            K.Lt(
+              K.app(shiftTerm(measure, 4), K.varTerm(1)),
+              K.app(shiftTerm(measure, 4), K.varTerm(3)),
+            ),
+            K.app(shiftTerm(predicate, 5), K.varTerm(2)),
+          ),
+        ),
+      );
+      const ih: Binder = { id: freshId(), name: "ih", role: "local", type: ihType };
+      let bodyCtx = pushed(measureCtx, ih);
+      const bodyDepth = bodyCtx.binders.length;
+
+      // The preconditions are the arguments of `B x`, so the body is under their binders.
+      const preLambdas: { name: string; type: Term }[] = [];
+      const preHyps: Hyp[] = [];
+      this.fn.signature.preconditions.forEach((fact, index) => {
+        const type = this.withHyps(hypsAt(hyps, bodyCtx.binders.length), () =>
+          exprTerm(bodyCtx, fact.prop, opts),
+        );
+        const binder: Binder = {
+          id: freshId(),
+          name: fact.binder?.name ?? `pre${index}`,
+          role: "hypothesis",
+          type,
+        };
+        preLambdas.push({ name: binder.name, type });
+        bodyCtx = pushed(bodyCtx, binder);
+        preHyps.push({
+          term: shiftTerm(type, 1),
+          proof: K.varTerm(0),
+          depth: bodyCtx.binders.length,
+          origin: "pre",
+        });
+      });
+
+      const frame: RecursionContext = { tuple, ih, measure, binders: components, spec };
+      this.recursion = frame;
+      let body: Term;
+      try {
+        body = this.elabStmts(
+          bodyCtx,
+          dedupeHyps([...this.recursionHyps(bodyCtx, components, spec), ...preHyps]),
+          this.fn.body,
+        );
+      } finally {
+        this.recursion = null;
+      }
+      let step = body;
+      // Inside-out, so the first precondition is the outermost binder — the order `B`'s
+      // arrow stack and the application below expect.
+      for (let i = preLambdas.length - 1; i >= 0; i -= 1) {
+        const lambda = preLambdas[i]!;
+        step = K.lam(lambda.name, lambda.type, step);
+      }
+      step = K.lam("ih", ihType, step);
+      step = K.lam("px", pxType, step);
+      step = K.lam("x", tupleType, step);
+
+      // The entry: the parameters themselves are the argument tuple.
+      const start = this.packTuple(
+        spec,
+        ctx,
+        components.map((binder) => K.varTerm(deBruijnIndex(ctx, binder))),
+      );
+      const p0 =
+        this.proveAux(
+          ctx,
+          hyps,
+          K.Le(K.intLit(0n), K.app(measure, start)),
+          "measure-nonneg",
+          this.fn.nameSpan,
+          `the entry measure of \`${this.fn.name}\``,
+        ) ?? K.tt;
+      const preProofs = this.fn.signature.preconditions.map((fact) =>
+        fact.binder === undefined ? K.tt : K.varTerm(deBruijnIndex(ctx, fact.binder)),
+      );
+      void bodyDepth;
+      return K.appMany(K.FixWf(0, tupleType, predicate, measure, step, start, p0), preProofs);
+    } finally {
+      restore();
+    }
+  }
+
+  /** The tuple telescope of a recursive function: its signature binders, in order. */
+  private recursionSpec(ctx: Ctx, binders: readonly Binder[], components: readonly Binder[]): TupleSpec {
     void ctx;
-    this.internal(
-      this.fn.nameSpan,
-      `\`${this.fn.name}\` uses recursion, which is not implemented yet`,
-    );
-    return this.finish("failed");
+    const componentAt = new Map<number, number>();
+    const positionOf = new Map<number, number>();
+    binders.forEach((binder, position) => {
+      positionOf.set(binder.id, position);
+      const index = components.findIndex((candidate) => candidate.id === binder.id);
+      if (index >= 0) componentAt.set(position, index);
+    });
+    const list: Component[] = components.map((binder) => ({
+      name: binder.name,
+      type: binder.type,
+      path: componentPath(componentAt.get(positionOf.get(binder.id)!)!),
+    }));
+    return {
+      components: list,
+      typeAt: (at, bound, index) => {
+        // `binder.type` is written in the context of the *preceding* signature binders, so
+        // the free index of binder `position` is `index - 1 - position`.
+        const source = components[index]!;
+        const own = positionOf.get(source.id)!;
+        const args = new Map<number, Term>();
+        binders.forEach((binder, position) => {
+          if (position >= own) return;
+          const component = componentAt.get(position);
+          if (component === undefined) {
+            // A type parameter: it stays an ambient binder, lifted past the telescope's own.
+            args.set(own - 1 - position, K.varTerm(deBruijnIndex(at, binder) + bound));
+          } else if (component < bound) {
+            args.set(own - 1 - position, K.varTerm(bound - 1 - component));
+          }
+        });
+        return substituteFree(source.type, args);
+      },
+    };
+  }
+
+  /**
+   * Register the signature binders as the components of `tuple`, for the duration of a walk:
+   * every slot that mentions one resolves to the projection of the tuple, and every *term*
+   * the extractor stored that mentions one (a binder type, the result type) is rewritten the
+   * same way by `fromExtractor`.  Returns the undo.
+   */
+  private installProjections(tuple: Binder, binders: readonly Binder[]): () => void {
+    const savedSlots: [number, ((at: Ctx) => Term | undefined) | undefined][] = [];
+    const savedExt: [number, ((at: Ctx) => Term | undefined) | undefined][] = [];
+    const restore = (): void => {
+      for (const [id, entry] of savedSlots) {
+        if (entry === undefined) this.inlineSlots.delete(id);
+        else this.inlineSlots.set(id, entry);
+      }
+      for (const [position, entry] of savedExt) {
+        if (entry === undefined) this.inlineExt.delete(position);
+        else this.inlineExt.set(position, entry);
+      }
+    };
+    binders.forEach((binder, index) => {
+      const path = componentPath(index);
+      const termOf = (at: Ctx): Term | undefined =>
+        at.binders.some((candidate) => candidate.id === tuple.id)
+          ? project(K.varTerm(deBruijnIndex(at, tuple)), path)
+          : undefined;
+      savedSlots.push([binder.id, this.inlineSlots.get(binder.id)]);
+      this.inlineSlots.set(binder.id, termOf);
+      const position = this.extOf.get(binder.id);
+      if (position !== undefined) {
+        savedExt.push([position, this.inlineExt.get(position)]);
+        this.inlineExt.set(position, termOf);
+      }
+    });
+    return restore;
+  }
+
+  /** The signature's own facts, restated about the argument tuple's components. */
+  private recursionHyps(ctx: Ctx, binders: readonly Binder[], spec: TupleSpec): Hyp[] {
+    const depth = ctx.binders.length;
+    const opts = this.optionsFor();
+    const out: Hyp[] = [];
+    const projection = (binder: Binder): Term | undefined => this.inlineSlots.get(binder.id)?.(ctx);
+    for (const fact of this.fn.signature.preconditions) {
+      const proof = fact.binder === undefined ? undefined : projection(fact.binder);
+      if (proof === undefined) continue;
+      try {
+        out.push({ term: exprTerm(ctx, fact.prop, opts), proof, depth, origin: "pre" });
+      } catch {
+        // The proposition cannot be built; the site that needs it reports its own failure.
+      }
+    }
+    binders.forEach((binder, index) => {
+      const value = projection(binder);
+      if (value === undefined) return;
+      if (binder.role === "in-range") {
+        const param = binders[index - 1];
+        const target = param === undefined ? undefined : projection(param);
+        if (target === undefined) return;
+        out.push({ term: K.InRange(target), proof: value, depth, origin: "param-in-range" });
+        return;
+      }
+      if (binder.role === "vec-len") {
+        const vec = binders[index + 1];
+        const vector = vec === undefined ? undefined : projection(vec);
+        if (vector === undefined || vec === undefined) return;
+        const vecType = this.fromExtractor(ctx, spec.components[index]!.type, this.fn.signature.binders.length);
+        const elem = vecType.tag === "Prim" ? vecType.args[0] : undefined;
+        if (elem === undefined) return;
+        out.push({
+          term: K.And(K.Le(K.intLit(0n), value), K.Le(value, K.intLit(K.MAX_VEC_LEN))),
+          proof: K.VecBounds(elem, value, vector),
+          depth,
+          origin: "vec-bounds",
+        });
+      }
+    });
+    return out;
   }
 
   // ---- statements ---------------------------------------------------------
@@ -2147,7 +2573,7 @@ class Elaborator {
         case "local": {
           const depth = ctx.binders.length;
           const value = this.elabExpr(ctx, hyps, stmt.value);
-          const inner = this.pushExt(ctx, stmt.binder);
+          const inner = this.pushExt(value.ctx, stmt.binder);
           // A local whose value carries no proof argument is substituted at every use: it is
           // still bound with a `let` (so the kernel term is unchanged, up to zeta), but a
           // goal that mentions it by name mentions its value instead, which is what lets a
@@ -2164,11 +2590,18 @@ class Elaborator {
           }
           let rest: Term;
           try {
-            rest = this.elabStmts(inner, hypsAt(hyps, depth + 1), stmts.slice(i + 1));
+            rest = this.elabStmts(
+              inner,
+              hypsAt([...hyps, ...value.facts], inner.binders.length),
+              stmts.slice(i + 1),
+            );
           } finally {
             if (inlinable) this.inlineSlots.delete(binder.id);
+            value.undo();
           }
-          return K.letTerm(stmt.binder.name, this.binderTypeAt(ctx, stmt.binder), value.term, rest);
+          return value.wrap(
+            K.letTerm(stmt.binder.name, this.binderTypeAt(value.ctx, stmt.binder), value.term, rest),
+          );
         }
         case "return":
           return this.elabReturn(ctx, hyps, stmt);
@@ -2193,12 +2626,61 @@ class Elaborator {
     return K.tt;
   }
 
-  /** Certify everything the expression needs, then build its term and collect its facts. */
-  private elabExpr(ctx: Ctx, hyps: readonly Hyp[], e: ExprIR): { term: Term; facts: Hyp[] } {
+  /**
+   * Certify everything the expression needs, then build its term and collect its facts.
+   *
+   * A proof-carrying call is bound with a `let` first (innermost call first), and the
+   * extended context is what the goals are built in: this is what keeps a `@post` or a
+   * `range` goal about a recursive call a *variable* instead of a term with certificates in
+   * it.  `wrap` emits the `let`s around the statement the value belongs to.
+   */
+  private elabExpr(
+    ctx: Ctx,
+    hyps: readonly Hyp[],
+    e: ExprIR,
+  ): { term: Term; facts: Hyp[]; ctx: Ctx; wrap: (body: Term) => Term; undo: () => void } {
     const opts = this.optionsFor();
-    const facts = this.withHyps(hyps, () => this.prepare(ctx, hyps, e, opts));
-    const term = this.withHyps([...hyps, ...facts], () => exprTerm(ctx, e, opts));
-    return { term, facts };
+    const binds: { binder: Binder; value: Term }[] = [];
+    const bound: ExprIR[] = [];
+    let work = ctx;
+    let callHyps = hypsAt(hyps, ctx.binders.length);
+    for (const node of callNodesIn(e)) {
+      // The call's own obligations (`pre-call`, the two measure sites) and its arguments'
+      // must be certified before its term can be built; the facts that walk derives are
+      // discarded here, because they would be stated about the *unbound* call.
+      this.withHyps(callHyps, () => this.prepare(work, callHyps, node, opts));
+      const info = this.callInfo(work, node, opts);
+      const type = info.packedType ?? this.valueTypeOf(work, node, info.packed);
+      const binder: Binder = { id: freshId(), name: "call", role: "local", type };
+      this.boundCalls.set(callSiteKey(node), { binder, depth: work.binders.length, applied: info.applied });
+      bound.push(node);
+      binds.push({ binder, value: info.packed });
+      work = pushed(work, binder);
+      // Now that the call is a variable, its facts (its result is `InRange`, the callee's
+      // postconditions) are worth keeping for the *next* call's obligations.
+      const atBound = hypsAt(callHyps, work.binders.length);
+      callHyps = [
+        ...atBound,
+        ...this.withHyps(atBound, () => this.derivedFacts(work, node, atBound, opts)),
+      ];
+    }
+    const shifted = hypsAt(hyps, work.binders.length);
+    const facts = this.withHyps(shifted, () => this.prepare(work, shifted, e, opts));
+    const term = this.withHyps([...shifted, ...facts], () => exprTerm(work, e, opts));
+    const wrap = (body: Term): Term => {
+      let out = body;
+      for (let i = binds.length - 1; i >= 0; i -= 1) {
+        const bind = binds[i]!;
+        out = K.letTerm(bind.binder.name, bind.binder.type, bind.value, out);
+      }
+      return out;
+    };
+    // The caller keeps the bindings alive for the whole statement (`@post` is certified
+    // after the value was bound) and undoes them when it is done.
+    const undo = (): void => {
+      for (const node of bound) this.boundCalls.delete(callSiteKey(node));
+    };
+    return { term, facts, ctx: work, wrap, undo };
   }
 
   private elabReturn(ctx: Ctx, hyps: readonly Hyp[], stmt: Extract<StmtIR, { kind: "return" }>): Term {
@@ -2243,8 +2725,10 @@ class Elaborator {
         ]);
       }
       const [a, b] = this.ifLeOperands(ctx, cond.expr, opts);
+      const thenBinder = this.branchBinder(cond.thenBinder, K.Le(a, b));
+      const elseBinder = this.branchBinder(cond.elseBinder, K.Lt(b, a));
       const thenTerm = this.elabReturnValue(
-        this.pushExt(ctx, cond.thenBinder),
+        this.pushExt(ctx, thenBinder),
         [
           ...hypsAt(base, depth + 1),
           { term: shiftTerm(K.Le(a, b), 1), proof: K.varTerm(0), depth: depth + 1, origin: "condition" },
@@ -2253,7 +2737,7 @@ class Elaborator {
         site,
       );
       const elseTerm = this.elabReturnValue(
-        this.pushExt(ctx, cond.elseBinder),
+        this.pushExt(ctx, elseBinder),
         [
           ...hypsAt(base, depth + 1),
           { term: shiftTerm(K.Lt(b, a), 1), proof: K.varTerm(0), depth: depth + 1, origin: "condition" },
@@ -2272,11 +2756,16 @@ class Elaborator {
     }
 
     const value = this.elabExpr(ctx, hyps, valueExpr);
-    const bound = this.bindReturnValue(ctx, hyps, valueExpr, value.term, value.facts);
-    const proof = this.withHyps(bound.hyps, () =>
-      this.certifyPost(bound.ctx, bound.hyps, site, bound.surface),
-    );
-    return bound.wrap(this.packResult(bound.ctx, bound.surface, proof, valueExpr));
+    try {
+      const atValue = hypsAt([...hyps, ...value.facts], value.ctx.binders.length);
+      const bound = this.bindReturnValue(value.ctx, atValue, valueExpr, value.term, value.facts);
+      const proof = this.withHyps(bound.hyps, () =>
+        this.certifyPost(bound.ctx, bound.hyps, site, bound.surface),
+      );
+      return value.wrap(bound.wrap(this.packResult(bound.ctx, bound.surface, proof, valueExpr)));
+    } finally {
+      value.undo();
+    }
   }
 
   /**
@@ -2417,8 +2906,10 @@ class Elaborator {
     }
 
     const [a, b] = this.ifLeOperands(ctx, cond.expr, this.optionsFor());
-    const thenCtx = this.pushExt(ctx, cond.thenBinder);
-    const elseCtx = this.pushExt(ctx, cond.elseBinder);
+    const thenBinder = this.branchBinder(cond.thenBinder, K.Le(a, b));
+    const elseBinder = this.branchBinder(cond.elseBinder, K.Lt(b, a));
+    const thenCtx = this.pushExt(ctx, thenBinder);
+    const elseCtx = this.pushExt(ctx, elseBinder);
     const thenTerm = this.elabStmts(
       thenCtx,
       [

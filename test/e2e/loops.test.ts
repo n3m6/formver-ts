@@ -7,12 +7,16 @@
  * and whose `index` proof is used at several depths) plus one failure fixture per obligation
  * kind a loop can produce, each with a counterexample that really falsifies the obligation.
  */
-import { describe, expect, test } from "bun:test";
+import { describe, expect, setDefaultTimeout, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import type { Diagnostic, DiagnosticKind } from "../../src/diagnostics";
 import * as K from "../../src/kernel/index";
 import { verify, type VerifyResult } from "../../src/verify";
+
+// The loop obligations of `binarySearch` need Z3's integer certificate search, which takes
+// seconds; the 5 s default is too tight.
+setDefaultTimeout(60_000);
 
 const repoRoot = resolve(import.meta.dir, "../..");
 

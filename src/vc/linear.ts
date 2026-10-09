@@ -666,11 +666,17 @@ export function leOfEq(
 ): K.Term {
   const from = shift(forward ? equality.lhs : equality.rhs, extra);
   const to = shift(forward ? equality.rhs : equality.lhs, extra);
-  const shifted = shift(from, 2);
+  // `fun (b' : Int) => fun (_ : Eq Int from b') => Le from b'`: the inner domain lives under
+  // `b'` alone (`from` lifted by one, `b'` at index 0), the body under both.  The domain used
+  // to be written for the deeper context, which the kernel rejects.
   const motive = K.lam(
     "_b",
     K.Int,
-    K.lam("_h", K.Eq(K.Int, shifted, K.varTerm(1)), K.Le(shifted, K.varTerm(1))),
+    K.lam(
+      "_h",
+      K.Eq(K.Int, shift(from, 1), K.varTerm(0)),
+      K.Le(shift(from, 2), K.varTerm(1)),
+    ),
   );
   return K.J(0, K.Int, from, motive, leRefl(from), to, proof);
 }

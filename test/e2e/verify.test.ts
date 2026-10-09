@@ -7,7 +7,7 @@
  * diagnostic kinds and locations, counterexamples (evaluated, never compared literally),
  * the imported `external` declarations and the injection plan.
  */
-import { describe, expect, test } from "bun:test";
+import { describe, expect, setDefaultTimeout, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { formatDiagnostic, spanText, type Diagnostic } from "../../src/diagnostics";
@@ -17,6 +17,10 @@ import { contentHash } from "../../src/extract/specs";
 import * as K from "../../src/kernel/index";
 import { verify, type VerifyResult } from "../../src/verify";
 import { lex } from "../../src/syntax/lexer";
+
+// `certify` asks Z3 for integer Farkas multipliers; the loop obligations of `binarySearch`
+// (a division specification plus the vector bounds) take seconds, well past the 5 s default.
+setDefaultTimeout(60_000);
 
 const repoRoot = resolve(import.meta.dir, "../..");
 
@@ -38,6 +42,7 @@ const PASS_FILES = [
   "examples/pass/shape.ts",
   "examples/pass/useClamp.ts",
   "examples/pass/binarySearch.ts",
+  "examples/pass/sumTo.ts",
 ] as const;
 
 // ---------------------------------------------------------------------------
@@ -373,23 +378,6 @@ describe("imported specs", () => {
     expect(strict.ok).toBe(false);
     expect(strict.functions.find((fn) => fn.name === "callBadAdd")!.dependsOnUncertified).toEqual(["badAdd"]);
   });
-});
-
-// ---------------------------------------------------------------------------
-// Recursion is part B's second half; until it lands the driver must not crash
-// ---------------------------------------------------------------------------
-
-describe("recursion (part B)", () => {
-  for (const file of ["examples/pass/sumTo.ts", "examples/fail/noDecrease.ts"] as const) {
-    test(`${file} is failed with an \`internal\` diagnostic naming recursion`, () => {
-      const result = run(file);
-      expect(result.ok).toBe(false);
-      const diagnostic = result.diagnostics.find((d) => d.kind === "internal")!;
-      expect(diagnostic).toBeDefined();
-      expect(diagnostic.message).toContain("recursion");
-      expect(result.functions.every((fn) => fn.status === "failed")).toBe(true);
-    });
-  }
 });
 
 // ---------------------------------------------------------------------------
