@@ -3,14 +3,17 @@
  *
  * Two hard rules from the design (section 2):
  *   - `package.json` has no runtime dependencies, ever.
- *   - `src/kernel/` (the only trusted component) imports nothing from outside itself,
- *     and uses neither Bun APIs nor npm packages.
+ *   - `src/kernel/` (the only trusted component) imports nothing from outside itself, and
+ *     uses neither Bun APIs, nor npm packages, nor ambient host globals.
  *
- * Both tests must pass before `src/kernel/` exists, so the kernel scan only runs when the
- * directory is present.
+ * The kernel scan is deliberately paranoid: it blanks comments and string contents (template
+ * literals included, keeping `${…}` interpolations visible), rejects every non-static module
+ * reference (`import(variable)`, `require`, aliased or not) and every ambient global, and
+ * resolves import targets through `realpathSync` so a symlink cannot point outside the
+ * kernel.  `test/hygiene-checker.test.ts` feeds this checker adversarial sources.
  */
 import { describe, expect, test } from "bun:test";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { dirname, relative, resolve, sep } from "node:path";
 
 const repoRoot = resolve(import.meta.dir, "..");
@@ -52,20 +55,97 @@ describe("package.json", () => {
 });
 
 /** Kernel files, or an empty list when `src/kernel/` does not exist yet. */
-function kernelFiles(): string[] {
-  if (!existsSync(kernelDir)) return [];
-  return [...new Bun.Glob("**/*.{ts,mts}").scanSync({ cwd: kernelDir, absolute: true })].sort();
+export function kernelFiles(dir: string = kernelDir): string[] {
+  if (!existsSync(dir)) return [];
+  return [...new Bun.Glob("**/*.{ts,mts}").scanSync({ cwd: dir, absolute: true })].sort();
+}
+
+export interface Stripped {
+  /** Comments removed; string contents kept (so specifiers are visible). */
+  readonly code: string;
+  /** `[start, end)` ranges of string-literal contents inside `code`. */
+  readonly strings: Array<[number, number]>;
+  /** Comments and string contents removed, so only executable code remains. */
+  readonly blanked: string;
 }
 
 /**
- * Remove comments, and optionally blank string/template literal contents. String contents
- * must be kept when scanning for import specifiers, but must be blanked before looking for
- * the `Bun` global, so that prose and strings cannot trip the check. Regex literals are not
- * handled; the kernel has no business containing any, and mis-lexing one can only produce
- * false negatives here.
+ * Strip comments and record string spans.  Template literals keep their `${…}`
+ * interpolations visible (recursively stripped) and have their literal text blanked, so a
+ * host global cannot hide inside an interpolation and an import mentioned inside a literal
+ * cannot produce a false positive.
  */
-function stripSource(source: string, blankStrings: boolean): string {
-  let out = "";
+export function stripSource(source: string): Stripped {
+  let code = "";
+  let blanked = "";
+  const strings: Array<[number, number]> = [];
+
+  const emitLiteral = (raw: string, content: string): void => {
+    code += raw;
+    const start = blanked.length;
+    blanked += '""';
+    strings.push([start, start]);
+    void content;
+  };
+
+  const scanString = (i: number, quote: string): number => {
+    const start = i;
+    i += 1;
+    while (i < source.length && source[i] !== quote) {
+      if (source[i] === "\\") i += 1;
+      i += 1;
+    }
+    i += 1;
+    emitLiteral(source.slice(start, i), source.slice(start + 1, i - 1));
+    return i;
+  };
+
+  const scanTemplate = (i: number): number => {
+    i += 1; // the opening backtick
+    let chunk = "`";
+    while (i < source.length && source[i] !== "`") {
+      if (source[i] === "\\") {
+        chunk += source.slice(i, i + 2);
+        i += 2;
+        continue;
+      }
+      if (source[i] === "$" && source[i + 1] === "{") {
+        emitLiteral(chunk + "${", "");
+        chunk = "";
+        i += 2;
+        let depth = 1;
+        const innerStart = i;
+        while (i < source.length && depth > 0) {
+          const ch = source[i]!;
+          if (ch === "{") depth += 1;
+          else if (ch === "}") depth -= 1;
+          if (depth === 0) break;
+          if (ch === '"' || ch === "'") {
+            i = scanString(i, ch);
+            continue;
+          }
+          if (ch === "`") {
+            i = scanTemplate(i);
+            continue;
+          }
+          i += 1;
+        }
+        // Recursively strip the interpolation so its code counts as code.
+        const inner = stripSource(source.slice(innerStart, i));
+        code += inner.code;
+        blanked += inner.blanked;
+        chunk = "}";
+        i += 1;
+        continue;
+      }
+      chunk += source[i];
+      i += 1;
+    }
+    i += 1; // the closing backtick
+    emitLiteral(`${chunk}\``, chunk);
+    return i;
+  };
+
   let i = 0;
   while (i < source.length) {
     const ch = source[i]!;
@@ -78,46 +158,91 @@ function stripSource(source: string, blankStrings: boolean): string {
       i += 2;
       while (i < source.length && !(source[i] === "*" && source[i + 1] === "/")) i += 1;
       i += 2;
-      out += " ";
+      code += " ";
+      blanked += " ";
       continue;
     }
-    if (ch === '"' || ch === "'" || ch === "`") {
-      const quote = ch;
-      const start = i;
-      i += 1;
-      while (i < source.length && source[i] !== quote) {
-        if (source[i] === "\\") i += 1;
-        i += 1;
-      }
-      i += 1;
-      out += blankStrings ? (quote === "`" ? "``" : '""') : source.slice(start, i);
+    if (ch === '"' || ch === "'") {
+      i = scanString(i, ch);
       continue;
     }
-    out += ch;
+    if (ch === "`") {
+      i = scanTemplate(i);
+      continue;
+    }
+    code += ch;
+    blanked += ch;
     i += 1;
   }
-  return out;
+  return { code, strings, blanked };
 }
 
-/** Every module specifier referenced by static imports, re-exports, require or import(). */
-function importSpecifiers(source: string): string[] {
-  const specifiers: string[] = [];
+const inside = (spans: ReadonlyArray<[number, number]>, index: number): boolean =>
+  spans.some(([start, end]) => index >= start && index < end);
+
+/** Module specifiers of static imports/re-exports; matches inside string literals are ignored. */
+export function importSpecifiers(source: string): string[] {
+  const { code, strings } = stripSource(source);
   const patterns = [
     /\bimport\s+(?:type\s+)?(?:[^"'`;]*?\bfrom\s*)?["']([^"']+)["']/g, // import x from "m"; import "m"
     /\bexport\s+(?:type\s+)?(?:\*|\{[^}]*\})\s*from\s*["']([^"']+)["']/g, // export ... from "m"
-    /\brequire\s*\(\s*["']([^"']+)["']\s*\)/g,
-    /\bimport\s*\(\s*["']([^"']+)["']\s*\)/g,
   ];
-  const code = stripSource(source, false);
+  const specifiers: string[] = [];
   for (const pattern of patterns) {
     for (const match of code.matchAll(pattern)) {
+      const specIndex = match.index + match[0].indexOf(match[1]!);
+      if (inside(strings, specIndex)) continue;
       specifiers.push(match[1]!);
     }
   }
   return specifiers;
 }
 
-function resolvesInsideKernel(fromFile: string, specifier: string): boolean {
+/** Ambient host capabilities the trusted kernel must never touch. */
+const FORBIDDEN_PATTERNS: ReadonlyArray<readonly [string, RegExp]> = [
+  ["the Bun global", /(^|[^\w.$])Bun\b/],
+  ["globalThis", /\bglobalThis\b/],
+  ["the `global` object", /\bglobal\b/],
+  ["the `self` global", /\bself\b/],
+  ["the `window` global", /\bwindow\b/],
+  ["the `process` global", /\bprocess\b/],
+  ["the `console` global", /\bconsole\b/],
+  ["the `Buffer` global", /\bBuffer\b/],
+  ["`require`", /\brequire\b/],
+  ["the `Deno` global", /\bDeno\b/],
+  ["`import.meta`", /\bimport\s*\.\s*meta\b/],
+  ["`eval`", /\beval\s*\(/],
+  ["the `Function` constructor", /\bFunction\s*\(/],
+  ["`setTimeout`/`setInterval`", /\bset(?:Timeout|Interval)\s*\(/],
+  ["`fetch`", /\bfetch\s*\(/],
+  ["`WebAssembly`", /\bWebAssembly\b/],
+  ["`TextEncoder`/`TextDecoder`", /\bText(?:En|De)coder\b/],
+  ["`crypto`", /\bcrypto\b/],
+  ["`performance`", /\bperformance\b/],
+];
+
+/** Every non-static module reference: any `import(...)` or `require`, aliased or not. */
+export function dynamicModuleReferences(source: string): string[] {
+  const { blanked } = stripSource(source);
+  const found: string[] = [];
+  if (/\bimport\s*\(/.test(blanked)) found.push("a dynamic `import(...)`");
+  if (/\brequire\s*\(/.test(blanked)) found.push("`require(...)`");
+  if (/\brequire\b/.test(blanked)) found.push("a `require` reference");
+  return found;
+}
+
+/** Forbidden ambient-global or dynamic-module uses in a source file. */
+export function hygieneViolations(source: string): string[] {
+  const { blanked } = stripSource(source);
+  const violations: string[] = [];
+  for (const [what, pattern] of FORBIDDEN_PATTERNS) {
+    if (pattern.test(blanked)) violations.push(what);
+  }
+  violations.push(...dynamicModuleReferences(source));
+  return [...new Set(violations)];
+}
+
+export function resolvesInsideKernel(fromFile: string, specifier: string, kernel: string = kernelDir): boolean {
   if (!specifier.startsWith("./") && !specifier.startsWith("../")) return false;
   const withoutQuery = specifier.replace(/[?#].*$/, "");
   const base = resolve(dirname(fromFile), withoutQuery);
@@ -128,12 +253,12 @@ function resolvesInsideKernel(fromFile: string, specifier: string): boolean {
   }
   const target = candidates.find((candidate) => existsSync(candidate));
   if (target === undefined) return false;
-  const inside = relative(kernelDir, target);
-  return inside.length > 0 && !inside.startsWith("..") && !inside.startsWith(`..${sep}`);
+  // `realpathSync` so a symlink inside the kernel cannot point outside it.
+  const real = realpathSync(target);
+  const realKernel = realpathSync(kernel);
+  const inside_ = relative(realKernel, real);
+  return inside_.length > 0 && !inside_.startsWith("..") && !inside_.startsWith(`..${sep}`);
 }
-
-/** Ways of naming the Bun global in code that has been stripped of comments and strings. */
-const BUN_GLOBAL_PATTERNS = [/(^|[^\w.$])Bun\b/, /globalThis\s*\.\s*Bun\b/];
 
 describe("src/kernel/ hygiene", () => {
   const files = kernelFiles();
@@ -141,8 +266,7 @@ describe("src/kernel/ hygiene", () => {
   test("imports only relative paths that resolve inside src/kernel/", () => {
     const violations: string[] = [];
     for (const file of files) {
-      const source = readFileSync(file, "utf8");
-      for (const specifier of importSpecifiers(source)) {
+      for (const specifier of importSpecifiers(readFileSync(file, "utf8"))) {
         if (!resolvesInsideKernel(file, specifier)) {
           violations.push(`${relative(repoRoot, file)} imports ${JSON.stringify(specifier)}`);
         }
@@ -151,12 +275,11 @@ describe("src/kernel/ hygiene", () => {
     expect(violations).toEqual([]);
   });
 
-  test("does not reference the Bun global", () => {
+  test("uses no Bun API, npm package, ambient global or dynamic module reference", () => {
     const violations: string[] = [];
     for (const file of files) {
-      const code = stripSource(readFileSync(file, "utf8"), true);
-      if (BUN_GLOBAL_PATTERNS.some((pattern) => pattern.test(code))) {
-        violations.push(relative(repoRoot, file));
+      for (const what of hygieneViolations(readFileSync(file, "utf8"))) {
+        violations.push(`${relative(repoRoot, file)} uses ${what}`);
       }
     }
     expect(violations).toEqual([]);
