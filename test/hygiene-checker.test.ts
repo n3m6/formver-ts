@@ -49,6 +49,10 @@ describe("hygiene checker", () => {
 
   test("static import specifiers are found, dynamic ones are rejected separately", () => {
     expect(importSpecifiers('import { a } from "./a";\nexport * from "../b";')).toEqual(["./a", "../b"]);
+    // `export * as ns from ...` and `export type * as ns from ...` used to slip through.
+    expect(importSpecifiers('export * as ns from "bun:ffi";')).toEqual(["bun:ffi"]);
+    expect(importSpecifiers('export type * as ns from "../b";')).toEqual(["../b"]);
+    expect(importSpecifiers('import "node:fs";')).toEqual(["node:fs"]);
     expect(dynamicModuleReferences('import("./a");')).toEqual(["a dynamic `import(...)`"]);
     const computed = dynamicModuleReferences("const p = './a'; import(p);");
     expect(computed).toEqual(["a dynamic `import(...)`"]);

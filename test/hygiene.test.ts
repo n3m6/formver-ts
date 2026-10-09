@@ -185,17 +185,17 @@ export function importSpecifiers(source: string): string[] {
   const { code, strings } = stripSource(source);
   const patterns = [
     /\bimport\s+(?:type\s+)?(?:[^"'`;]*?\bfrom\s*)?["']([^"']+)["']/g, // import x from "m"; import "m"
-    /\bexport\s+(?:type\s+)?(?:\*|\{[^}]*\})\s*from\s*["']([^"']+)["']/g, // export ... from "m"
+    /\bfrom\s*["']([^"']+)["']/g, // export ... from "m", including `export * as ns from "m"`
   ];
-  const specifiers: string[] = [];
+  const found = new Set<string>();
   for (const pattern of patterns) {
     for (const match of code.matchAll(pattern)) {
       const specIndex = match.index + match[0].indexOf(match[1]!);
       if (inside(strings, specIndex)) continue;
-      specifiers.push(match[1]!);
+      found.add(match[1]!);
     }
   }
-  return specifiers;
+  return [...found];
 }
 
 /** Ambient host capabilities the trusted kernel must never touch. */

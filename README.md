@@ -115,9 +115,12 @@ counterexample that Z3 found (the values vary between runs):
 
 ```console
 $ bun run verify examples/fail/clampNoPre.ts
-examples/fail/clampNoPre.ts:5:15: error[post]: postcondition `(InRange(result) && ((lo <= result) && (result <= hi)))` may not hold
+examples/fail/clampNoPre.ts:5:15: error[post]: postcondition `lo <= result && result <= hi` may not hold
   counterexample: x = -1, lo = 0, hi = -1
 ```
+
+A `path:` line is added when the failing case came from a case split (a `!==` or `||`
+hypothesis): it names the hypotheses assumed in that case, exactly as specification 4.3 shows.
 
 ## The annotation surface
 
@@ -382,10 +385,11 @@ and the repository hygiene rules — and `bun run typecheck` is `tsc --noEmit` u
   expected diagnostic, as the plan describes).
 - Counterexample values are Z3's choice and **vary between runs**, exactly as the plan warns;
   `clampNoPre.ts` reports each of its two failing `return`s with the values Z3 happened to pick.
-- A diagnostic prints the **elaborated** proposition, so a `@post` message includes the
-  `InRange` conjunct (`(InRange(result) && ((lo <= result) && (result <= hi)))`) rather than the
-  raw tag text, and the illustrative `path:` line of section 4.3 appears only when a case split
-  produced the counterexample.
+- A `@pre`/`@post`/`@invariant` diagnostic quotes the **user's spec text** (`postcondition
+  \`lo <= result && result <= hi\` may not hold`), as specification 4.3 shows; an obligation with
+  no user text of its own (an index, slice, range, measure or invariant-preservation check)
+  quotes the elaborated proposition instead. The illustrative `path:` line of section 4.3
+  appears when a case split produced the counterexample.
 - The runtime `PreconditionError`'s `loc`/`file`/`line` fields point at the `@pre` tag's own
   location (`safeGet.ts:2:4`), while the thrown stack frame is the function's line
   (`safeGet.ts:4`) — that is the line the error is reported at, and the line numbers are exact

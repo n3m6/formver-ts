@@ -191,8 +191,10 @@ describe("get needs the right bounds proof", () => {
         getMk(intMk, K.intLitMk(3n), v("w"), K.intLitMk(1n), () => boundsProof(1n, 3n)),
       ),
     );
-    expect(expectOk(K.inferType(env, good))).toBeDefined();
-    expect(vector(3n)).toBeDefined();
+    const inferred = expectOk(K.inferType(env, good));
+    // The proof's type is a well-formed type, and the vector type it mentions is too.
+    expect(K.isTypeTerm(env, inferred).ok).toBe(true);
+    expect(K.isTypeTerm(env, vector(3n)).ok).toBe(true);
   });
 });
 
@@ -227,7 +229,6 @@ describe("fixWf requires a decrease proof", () => {
       ),
     );
     expect(expectErr(K.inferType(env, fixAt(step))).reason).toBe("type-mismatch");
-    expect(ihType("x", leMk(K.intLitMk(0n), v("y")), ltMk(v("y"), v("x")))).toBeDefined();
   });
 
   test("calling it with `Le (m y) (m x)` instead of `Lt (m y) (m x)` is rejected", () => {
