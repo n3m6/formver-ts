@@ -111,3 +111,9 @@ dist
 
 # TernJS port file
 .tern-port
+
+# Downloaded Z3 library and cache (see scripts/setup-z3.ts)
+.z3/
+
+# Verification result cache
+.dep-verify/

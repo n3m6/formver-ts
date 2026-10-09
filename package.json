@@ -1,0 +1,17 @@
+{
+  "name": "formver-ts",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "setup": "bun scripts/setup-z3.ts",
+    "verify": "bun src/cli.ts",
+    "demo": "bun scripts/demo.ts",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "7.0.2",
+    "@types/bun": "1.4.2"
+  }
+}

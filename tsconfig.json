@@ -1,0 +1,12 @@
+{
+  "compilerOptions": {
+    "strict": true,
+    "noEmit": true,
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "target": "esnext",
+    "types": ["bun"]
+  },
+  "include": ["src", "scripts", "test", "examples/pass"],
+  "exclude": ["examples/fail"]
+}
