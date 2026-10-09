@@ -354,6 +354,16 @@ Each is reported as a located diagnostic, never as a crash or a wrong verdict:
 - A function whose *declaration* is outside the fragment (a `boolean` return type, a missing
   return type, `async`) is reported as `rejected`, but it can be absent from the per-function
   verdict table, which lists the functions the extractor could build an IR for.
+- A **generic call's result keeps the callee's declared type parameter** at the call site. The
+  elaborator instantiates it (passing the result on, returning it, or using it as another
+  generic argument all work), but the extractor still sees `T`, so arithmetic on the result is
+  rejected with `` `+` needs two `number` operands ``. Use the concrete callee or inline the
+  index (`a[i]`) — the kernel reasons about `get`, not about a call.
+- A verified function that calls an **imported** one cannot use its result in arithmetic when
+  the callee's spec says nothing about the range: the call is opaque to the kernel (there is no
+  equation `safeGet(a, i) = a[i]`), so such a `range` obligation fails in strict mode and gets a
+  runtime check in lenient mode. This is the "no congruence reasoning about array elements"
+  limit seen from the call side.
 
 ## Repository layout
 
