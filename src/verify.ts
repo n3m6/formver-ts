@@ -33,6 +33,7 @@ import { contentHash, SpecResolver } from "./extract/specs";
 import { parseFile } from "./syntax/parser";
 import type { FnDecl } from "./syntax/ast";
 import { tagsNamed } from "./syntax/jsdoc";
+import * as z3 from "./vc/z3";
 
 /** A function's verdict: the elaborator's statuses plus `rejected` for a fragment error. */
 export type Verdict = FunctionStatus | "rejected";
@@ -112,6 +113,13 @@ export interface VerifyOptions {
    * Off by default: one file is verified at a time.
    */
   readonly verifyImports?: boolean;
+  /**
+   * Whether an SMT solver is available.  Defaults to `z3.isAvailable()`: without `libz3`,
+   * every obligation is reported as `smt-only` — not discharged, so a runtime check is
+   * needed — instead of failing with a solver error (section 4.4).  Pass `true` explicitly
+   * to see the solver's own error messages.
+   */
+  readonly solver?: boolean;
 }
 
 /**
@@ -120,6 +128,7 @@ export interface VerifyOptions {
  */
 export function verify(path: string, source: string, options: VerifyOptions = {}): VerifyResult {
   const strict = options.strict === true;
+  const solver = options.solver ?? z3.isAvailable();
   let env = options.env ?? K.emptyEnv();
   const resolver = options.resolver ?? new SpecResolver(options.readFile);
   const parsed = parseFile(path, source);
@@ -227,6 +236,7 @@ export function verify(path: string, source: string, options: VerifyOptions = {}
       uncertified,
       sourceHash: hash,
       admitUncertified: !strict,
+      solver,
     });
     env = outcome.env;
     if (outcome.declarationError !== undefined) diagnostics.push(outcome.declarationError);
@@ -526,6 +536,7 @@ function importCertified(spec: ImportedSpec, options: VerifyOptions): boolean | 
       resolver: options.resolver,
       readFile: options.readFile,
       verifyImports: false,
+      solver: options.solver,
     });
     const verdict = result.functions.find((fn) => fn.name === spec.name);
     return verdict === undefined ? "unknown" : verdict.certified;

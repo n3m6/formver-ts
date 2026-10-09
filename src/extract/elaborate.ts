@@ -109,7 +109,16 @@ export interface ElaborateOptions {
    * still be elaborated (lenient mode).  Strict mode leaves the environment untouched.
    */
   readonly admitUncertified?: boolean;
+  /**
+   * `false` when no SMT solver is available (the section 4.4 "libz3 is missing" rule): every
+   * obligation is then reported as `smt-only` — "not discharged, a runtime check is needed" —
+   * instead of failing with a solver error, and the function is never kernel-certified.
+   */
+  readonly solver?: boolean;
 }
+
+/** Why an obligation is `smt-only` when the solver was never asked (section 4.4). */
+export const NO_SOLVER_REASON = "no SMT solver is available";
 
 export interface ElaborationOutcome {
   readonly result: FunctionElaboration;
@@ -624,6 +633,8 @@ class Elaborator {
   >();
   private auxCount = 0;
   private readonly dependsOnUncertified = new Set<string>();
+  /** Set once an obligation was left to a runtime check because no solver is available. */
+  private noSolver = false;
 
   /**
    * Extraction-time position of each binder the elaborator has in scope, keyed by binder id.
@@ -708,7 +719,7 @@ class Elaborator {
     const failed = [...this.outcomes.values()].some((o) => o.status === "failed");
     if (failed) return this.finish("failed", term);
 
-    const smtOnly = [...this.outcomes.values()].some((o) => o.status === "smt-only");
+    const smtOnly = this.noSolver || [...this.outcomes.values()].some((o) => o.status === "smt-only");
     const checked = K.checkType(this.env, term, this.fn.signature.type);
     if (!checked.ok) {
       if (smtOnly) return this.finish("smt-only", term);
@@ -1920,6 +1931,12 @@ class Elaborator {
       }
     }
 
+    // No solver: the obligation is not discharged, and lenient mode injects a runtime check.
+    if (this.options.solver === false) {
+      this.noSolver = true;
+      return { status: "smt-only", detail: { reason: NO_SOLVER_REASON } };
+    }
+
     const kept = hypotheses;
     const obligation: Obligation = {
       id: `${this.fn.name}#${site.id}`,
@@ -1957,8 +1974,11 @@ class Elaborator {
         severity: "warning",
         span: site.span,
         message:
-          `Z3 proved the ${site.kind} obligation \`${site.text}\` but no kernel certificate was ` +
-          `found; a runtime check will be needed`,
+          solved.detail?.reason === NO_SOLVER_REASON
+            ? `no SMT solver is available, so the ${site.kind} obligation \`${site.text}\` was ` +
+              `not discharged; a runtime check will be needed`
+            : `Z3 proved the ${site.kind} obligation \`${site.text}\` but no kernel certificate was ` +
+              `found; a runtime check will be needed`,
       });
       return;
     }
@@ -2004,6 +2024,18 @@ class Elaborator {
     );
     for (const hyp of list) {
       if (sameTerm(hyp.term, goal)) return hyp.proof;
+    }
+    // No solver: leave a placeholder proof and a warning.  `noSolver` keeps the function from
+    // being certified, so the kernel never sees the placeholder.
+    if (this.options.solver === false) {
+      this.noSolver = true;
+      this.diagnostics.push({
+        kind: "uncertified",
+        severity: "warning",
+        span,
+        message: `no SMT solver is available, so ${what} was not discharged; a runtime check will be needed`,
+      });
+      return K.tt;
     }
     this.auxCount += 1;
     const obligation: Obligation = {
