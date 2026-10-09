@@ -149,10 +149,19 @@ const argsText = (parts: readonly string[]): string => `[${parts.join(",")}]`;
 
 /** The canonical key of any value. See the module comment for what it identifies. */
 export function keyOfValue(value: Value, irrelevantOf: IrrelevantOf): string {
-  return keyValue(value, 0, irrelevantOf);
+  return keyValue(value, 0, irrelevantOf, "");
 }
 
-function keyValue(value: Value, depth: number, irrelevantOf: IrrelevantOf): string {
+/**
+ * Binders of a value spliced in from a closure's environment are named in a namespace of
+ * their own.  Without it, a binder inside such a value and a binder of the term being
+ * traversed could print the same `Bound(n)`, which would make two *different* values key
+ * equally — and equal keys make `Le` conversion identify non-equivalent propositions, which
+ * would let `Farkas` prove `Empty` (a soundness hole, not merely a completeness one).
+ */
+const SUBSTITUTED = "\u0001";
+
+function keyValue(value: Value, depth: number, irrelevantOf: IrrelevantOf, ns: string): string {
   switch (value.tag) {
     case "Sort":
       return `Sort(${value.level})`;
@@ -164,17 +173,17 @@ function keyValue(value: Value, depth: number, irrelevantOf: IrrelevantOf): stri
       return "Proof";
     case "Pair":
       // The Sigma annotation is a type; conversion ignores it, so the key ignores it too.
-      return `Pair(${keyValue(value.first, depth, irrelevantOf)},${keyValue(value.second, depth, irrelevantOf)})`;
+      return `Pair(${keyValue(value.first, depth, irrelevantOf, ns)},${keyValue(value.second, depth, irrelevantOf, ns)})`;
     case "Pi":
-      return `Pi(${keyValue(value.domain, depth, irrelevantOf)},${keyClosure(value.codomain, depth, irrelevantOf)})`;
+      return `Pi(${keyValue(value.domain, depth, irrelevantOf, ns)},${keyClosure(value.codomain, depth, irrelevantOf, ns)})`;
     case "Lam":
-      return `Lam(${keyValue(value.domain, depth, irrelevantOf)},${keyClosure(value.body, depth, irrelevantOf)})`;
+      return `Lam(${keyValue(value.domain, depth, irrelevantOf, ns)},${keyClosure(value.body, depth, irrelevantOf, ns)})`;
     case "Sigma":
-      return `Sig(${keyValue(value.first, depth, irrelevantOf)},${keyClosure(value.second, depth, irrelevantOf)})`;
+      return `Sig(${keyValue(value.first, depth, irrelevantOf, ns)},${keyClosure(value.second, depth, irrelevantOf, ns)})`;
     case "Neutral": {
-      const head = keyHead(value.head, depth, irrelevantOf);
+      const head = keyHead(value.head, depth, irrelevantOf, ns);
       if (value.spine.length === 0) return head;
-      return `${head}(${value.spine.map((arg) => keyValue(arg, depth, irrelevantOf)).join(",")})`;
+      return `${head}(${value.spine.map((arg) => keyValue(arg, depth, irrelevantOf, ns)).join(",")})`;
     }
   }
 }
@@ -183,24 +192,25 @@ function keyClosure(
   closure: { readonly body: Term; readonly env: readonly Value[] },
   depth: number,
   irrelevantOf: IrrelevantOf,
+  ns: string,
 ): string {
-  return keyTerm(closure.body, closure.env, depth + 1, 0, irrelevantOf);
+  return keyTerm(closure.body, closure.env, depth + 1, 0, irrelevantOf, ns);
 }
 
-function keyHead(head: Head, depth: number, irrelevantOf: IrrelevantOf): string {
+function keyHead(head: Head, depth: number, irrelevantOf: IrrelevantOf, ns: string): string {
   switch (head.tag) {
     case "Var":
       return `Var(${head.level})`;
     case "Const":
       return named("Const", head.name);
     case "Fst":
-      return `Fst(${keyValue(head.pair, depth, irrelevantOf)})`;
+      return `Fst(${keyValue(head.pair, depth, irrelevantOf, ns)})`;
     case "Snd":
-      return `Snd(${keyValue(head.pair, depth, irrelevantOf)})`;
+      return `Snd(${keyValue(head.pair, depth, irrelevantOf, ns)})`;
     case "Prim": {
       const mask = irrelevantOf(head.op);
       const parts = head.args.map((arg, index) =>
-        mask !== undefined && mask.includes(index) ? "_" : keyValue(arg, depth, irrelevantOf),
+        mask !== undefined && mask.includes(index) ? "_" : keyValue(arg, depth, irrelevantOf, ns),
       );
       return `Prim(${head.level}:${named("", head.op)})${argsText(parts)}`;
     }
@@ -211,12 +221,14 @@ function keyHead(head: Head, depth: number, irrelevantOf: IrrelevantOf): string 
  * The key of a term that lives inside a closure, e.g. the body of a `Lam` value. `depth`
  * counts the binders the traversal has introduced, *including* this closure's own
  * parameter; `local` counts the binders inside this term; `env` gives the values of the
- * free variables the closure was created under. A de Bruijn index therefore means one of:
+ * free variables the closure was created under; `ns` namespaces the binders of values
+ * spliced in from `env` (see `SUBSTITUTED`).  A de Bruijn index therefore means one of:
  *
  *   - `< local`: a binder inside this term, named by its index relative to the traversal;
  *   - `=== local`: the closure's parameter, named by the traversal depth;
- *   - `> local`: a variable of the closure's environment, substituted by its value (which
- *     lives outside this closure, so it is rendered one binder shallower).
+ *   - `> local`: a variable of the closure's environment, substituted by its value, which
+ *     lives outside this closure and is therefore keyed at the canonical depth 0 (so the
+ *     same value keys the same however deep it is substituted).
  *
  * Names never depend on how deep the value happens to be used, so two values that differ
  * only in the levels of their bound variables key the same, and two that differ in what a
@@ -228,17 +240,19 @@ function keyTerm(
   depth: number,
   local: number,
   irrelevantOf: IrrelevantOf,
+  ns: string,
 ): string {
-  const bound = (index: number): string => `Bound(${depth + local - 1 - index})`;
-  const sub = (t: Term, extra: number): string => keyTerm(t, env, depth, local + extra, irrelevantOf);
+  const bound = (index: number): string => `Bound(${ns}${depth + local - 1 - index})`;
+  const sub = (t: Term, extra: number): string => keyTerm(t, env, depth, local + extra, irrelevantOf, ns);
   switch (term.tag) {
     case "Var": {
       if (term.index < local) return bound(term.index);
       const outer = term.index - local;
-      if (outer === 0) return `Bound(${depth - 1})`;
+      if (outer === 0) return `Bound(${ns}${depth - 1})`;
       const slot = env.length - outer;
       const value = slot >= 0 && slot < env.length ? env[slot] : undefined;
-      return value === undefined ? `Free(${term.index})` : keyValue(value, depth - 1, irrelevantOf);
+      if (value === undefined) return `Free(${term.index})`;
+      return keyValue(value, 0, irrelevantOf, ns === "" ? SUBSTITUTED : ns);
     }
     case "Sort":
       return `Sort(${term.level})`;

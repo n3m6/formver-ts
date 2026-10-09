@@ -2392,7 +2392,30 @@ class FnChecker implements LoopHost {
             const checked = this.checkExpression(declaration.init, ctx, env, {});
             if (checked === null) continue;
             const mutable = stmt.declKind === "let";
-            const bound = bind(ctx, declaration.name, valueKernelType(ctx, checked.type), "local", declaration.name, declaration.nameSpan);
+            let bound: { ctx: Ctx; binder: Binder };
+            if (checked.type.kind === "vec") {
+              // A vector-valued local keeps its *length expression* in the kernel type
+              // (`Vec T (j - i)`), so `out.length` and `out[i]` work without a length binder.
+              // Element ranges of a derived `readonly number[]` are a different matter: the
+              // kernel has no congruence rule for `get` over `slice`/`append`, so there is no
+              // way to prove them — reject that case with a located error (section 4.2).
+              if (checked.type.elem!.kind === "int") {
+                this.reporter.error(
+                  declaration.nameSpan,
+                  `\`${declaration.name}\`: a \`readonly number[]\` local cannot be verified, because the kernel cannot derive element ranges for a derived array; use a generic element type or inline the array expression`,
+                );
+                continue;
+              }
+              if (checked.vecLength === undefined) {
+                this.reporter.error(declaration.nameSpan, "a vector needs a known length");
+                continue;
+              }
+              const lengthTerm = exprTerm(ctx, checked.vecLength, {});
+              const vecType = K.Vec(elemKernelType(ctx, checked.type.elem!), lengthTerm);
+              bound = bind(ctx, declaration.name, vecType, "local", declaration.name, declaration.nameSpan);
+            } else {
+              bound = bind(ctx, declaration.name, valueKernelType(ctx, checked.type), "local", declaration.name, declaration.nameSpan);
+            }
             ctx = bound.ctx;
             env = envWith(env, {
               name: declaration.name,
@@ -3942,9 +3965,11 @@ export function extractFile(path: string, source: string, options: ExtractOption
 }
 
 /**
- * Run one extraction step for one function, turning any failure into a located `internal`
- * diagnostic.  Extraction must never throw on user input (section 2, hard rules): a crash in
- * the untrusted layer is reported like any other problem instead of stopping the build.
+ * Run one extraction step for one function, turning any failure into a located diagnostic.
+ * Extraction must never throw on user input (section 2, hard rules): a crash in the untrusted
+ * layer is reported like any other problem instead of stopping the build.  An `ExtractError` is
+ * a deliberate "this is outside the fragment" signal, so it is reported as `fragment` (section
+ * 4.3); anything else is a genuine internal failure.
  */
 function guard<T>(
   reporter: Reporter,
@@ -3955,11 +3980,14 @@ function guard<T>(
     return run();
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
+    const fragment = error instanceof ExtractError;
     reporter.diagnostics.push({
-      kind: "internal",
+      kind: fragment ? "fragment" : "internal",
       severity: "error",
       span: fn.nameSpan,
-      message: `could not extract \`${fn.name}\`: ${detail}`,
+      message: fragment
+        ? `\`${fn.name}\` uses a construct outside the verified fragment: ${detail}`
+        : `could not extract \`${fn.name}\`: ${detail}`,
     });
     return null;
   }

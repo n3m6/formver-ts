@@ -299,6 +299,17 @@ export function lowerLoop(host: LoopHost, request: LoopRequest): LoopIR | null {
   }
 
   // Paths: component `i` is `fst` after `snd` repeated `i` times (the tuple ends in `Unit`).
+  for (const variable of carried) {
+    // The loop state is a tuple of *values*: it cannot carry a vector's length, so a
+    // reassigned `readonly T[]` is outside the fragment (a documented limit).
+    if (variable.type.kind === "vec") {
+      host.report(
+        variable.span ?? span,
+        `\`${variable.name}\` cannot be reassigned inside a loop: the loop state cannot carry the length of a \`readonly T[]\``,
+      );
+      return null;
+    }
+  }
   const withPaths: Carried[] = carried.map((c, index) => ({ ...c, path: [...Array(index).fill(1), 0] }));
 
   // ---- the state tuple and the loop function's scope -------------------------
