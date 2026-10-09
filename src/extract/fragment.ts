@@ -1160,6 +1160,22 @@ class SpecParser {
     return expr;
   }
 
+  /**
+   * Where the parse gave up: the token it stopped on, or the last token when it ran off the
+   * end.  The caller maps it to a source span, so a multi-line spec reports the offending
+   * line instead of the whole tag.
+   */
+  failureSpan(): Span {
+    const tokens = this.tokens.filter((token) => token.kind !== "eof");
+    const token = this.current ?? tokens[tokens.length - 1];
+    if (token === undefined || token.kind === "eof") {
+      const last = tokens[tokens.length - 1];
+      if (last === undefined) return this.spanOf(0, 0);
+      return this.spanOf(last.span.offset, last.span.endOffset ?? last.span.offset + 1);
+    }
+    return this.spanOf(token.span.offset, token.span.endOffset ?? token.span.offset + 1);
+  }
+
   // ---- token helpers
   private get current(): Token | undefined {
     return this.tokens[this.position];
@@ -1408,11 +1424,14 @@ function decodeString(raw: string): string {
 export function specTagExpression(
   tag: JSDocTag,
   spanOf: (start: number, end: number) => Span,
+  onFailure?: (span: Span) => void,
 ): A.Expr | null {
   if (tag.text.trim() === "") return null;
   const lexed = lex(tag.text, tag.span.file);
   const parser = new SpecParser(lexed.tokens, spanOf);
-  return parser.parse();
+  const ast = parser.parse();
+  if (ast === null && onFailure !== undefined) onFailure(parser.failureSpan());
+  return ast;
 }
 
 // ===========================================================================
@@ -2122,8 +2141,15 @@ class FnChecker implements LoopHost {
         tagSourceOffset(tag, start),
         tagSourceOffset(tag, Math.max(start, end)),
       );
-    const ast = specTagExpression(tag, spanOf);
-    if (ast === null) this.reporter.parseError(tag.textSpan, "cannot parse this spec expression");
+    const failure: { span: Span | null } = { span: null };
+    const ast = specTagExpression(tag, spanOf, (span) => {
+      failure.span = span;
+    });
+    if (ast === null) {
+      // Point at the token the spec parser gave up on: on a multi-line tag that is the
+      // offending line, not the first character of the tag.
+      this.reporter.parseError(failure.span ?? tag.textSpan, "cannot parse this spec expression");
+    }
     return ast;
   }
 
