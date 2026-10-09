@@ -509,7 +509,7 @@ function planFor(
       exported: fn.exported,
       kind: site.kind,
       span: site.span,
-      specText: site.text,
+      specText: site.specText ?? site.text,
       certified: outcome?.status === "certified",
       isPrecondition: site.kind === "pre-call",
       isBoundaryGuard: false,

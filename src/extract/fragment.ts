@@ -166,6 +166,8 @@ export interface FactIR {
   readonly binder?: Binder;
   /** Short rendering, for diagnostics. */
   readonly text?: string;
+  /** The spec text as the user wrote it (`@pre`/`@post`/`@invariant` tag body), for diagnostics. */
+  readonly sourceText?: string;
 }
 
 export interface Narrowing {
@@ -299,6 +301,13 @@ export interface ObligationSite {
   readonly resultValue?: ExprIR;
   /** A short rendering of the goal, for diagnostics. */
   readonly text: string;
+  /**
+   * The spec text the user wrote for this obligation (`@post`/`@pre`/`@invariant` tag bodies),
+   * when there is one.  Diagnostics prefer it over `text`, which renders the *elaborated*
+   * proposition (with the synthesized `InRange` conjuncts) — specification 4.3 shows the
+   * user's text: ``postcondition `lo <= result && result <= hi` may not hold``.
+   */
+  readonly specText?: string;
 }
 
 export interface ParamIR {
@@ -1801,7 +1810,13 @@ function buildSignature(
     }
     const bound = bind(ctx, `pre${index}`, exprTerm(ctx, expr), "pre", undefined, tag.span);
     ctx = bound.ctx;
-    preconditions.push({ prop: expr, origin: "pre", binder: bound.binder, text: renderExpr(expr) });
+    preconditions.push({
+      prop: expr,
+      origin: "pre",
+      binder: bound.binder,
+      text: renderExpr(expr),
+      sourceText: tag.text.trim(),
+    });
   });
 
   // ---- result ---------------------------------------------------------------
@@ -1964,7 +1979,12 @@ function buildResult(
       reporter.error(tag.textSpan, "`@post` must be a boolean expression");
       continue;
     }
-    posts.push({ prop: expr, origin: "condition", text: renderExpr(expr) });
+    posts.push({
+      prop: expr,
+      origin: "condition",
+      text: renderExpr(expr),
+      sourceText: tag.text.trim(),
+    });
   }
 
   const postTerms = posts.map((post) => exprTerm(resultCtx, post.prop, { result: K.varTerm(0) }));
@@ -2267,7 +2287,14 @@ class FnChecker implements LoopHost {
     return out;
   }
 
-  site(kind: ObligationKind, span: Span, ctx: Ctx, goalExpr: ExprIR, resultValue?: ExprIR): ObligationSite {
+  site(
+    kind: ObligationKind,
+    span: Span,
+    ctx: Ctx,
+    goalExpr: ExprIR,
+    resultValue?: ExprIR,
+    specText?: string,
+  ): ObligationSite {
     const site: ObligationSite = {
       id: this.ids.fresh(),
       kind,
@@ -2277,6 +2304,7 @@ class FnChecker implements LoopHost {
       goal: goalExpr,
       resultValue,
       text: renderExpr(goalExpr),
+      ...(specText === undefined || specText === "" ? {} : { specText }),
     };
     if (this.specDepth === 0) this.sites.push(site);
     return site;
@@ -2595,7 +2623,13 @@ class FnChecker implements LoopHost {
       }));
     }
     const goalExpr = parts.length === 0 ? this.trueExpr(stmt.span) : this.conjoin(parts, ctx, env, stmt.span);
-    const site = this.site("post", stmt.span, ctx, goalExpr, checked);
+    // Specification 4.3 quotes the user's `@post` text (`lo <= result && result <= hi`) rather
+    // than the elaborated goal, which also carries the synthesized `InRange result` conjunct.
+    const postText = result.posts
+      .map((post) => post.sourceText ?? post.text ?? "")
+      .filter((text) => text !== "")
+      .join(" && ");
+    const site = this.site("post", stmt.span, ctx, goalExpr, checked, postText);
     return { value: checked, site };
   }
 
@@ -3488,7 +3522,11 @@ class FnChecker implements LoopHost {
       if (instantiated !== null) preParts.push(instantiated);
     }
     const preGoal = preParts.length === 0 ? this.trueExpr(ast.span) : this.conjoin(preParts, ctx, env, ast.span);
-    const site = this.site("pre-call", ast.span, ctx, preGoal);
+    const preText = signature.preconditions
+      .map((pre) => pre.sourceText ?? "")
+      .filter((text) => text !== "")
+      .join(" && ");
+    const site = this.site("pre-call", ast.span, ctx, preGoal, undefined, preText);
     const sites: ObligationSite[] = [site];
     if (target.kind === "self") {
       if (this.measure !== null) {

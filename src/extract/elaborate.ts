@@ -2013,6 +2013,9 @@ class Elaborator {
     // both; the location is the same, so it is reported once.
     if (this.reported.has(site.id)) return;
     this.reported.add(site.id);
+    // Specification 4.3 quotes the user's spec text when there is one; `site.text` renders the
+    // elaborated proposition, which also carries synthesized conjuncts (e.g. `InRange result`).
+    const specText = site.specText ?? site.text;
     if (solved.status === "smt-only") {
       this.diagnostics.push({
         kind: "uncertified",
@@ -2020,9 +2023,9 @@ class Elaborator {
         span: site.span,
         message:
           solved.detail?.reason === NO_SOLVER_REASON
-            ? `no SMT solver is available, so the ${site.kind} obligation \`${site.text}\` was ` +
+            ? `no SMT solver is available, so the ${site.kind} obligation \`${specText}\` was ` +
               `not discharged; a runtime check will be needed`
-            : `Z3 proved the ${site.kind} obligation \`${site.text}\` but no kernel certificate was ` +
+            : `Z3 proved the ${site.kind} obligation \`${specText}\` but no kernel certificate was ` +
               `found; a runtime check will be needed`,
       });
       return;
@@ -2033,8 +2036,8 @@ class Elaborator {
       span: site.span,
       message:
         solved.detail?.counterexample === undefined
-          ? `${obligationMessage(site.kind, site.text)}${solved.detail?.reason === undefined ? "" : ` (${solved.detail.reason})`}`
-          : obligationMessage(site.kind, site.text),
+          ? `${obligationMessage(site.kind, specText)}${solved.detail?.reason === undefined ? "" : ` (${solved.detail.reason})`}`
+          : obligationMessage(site.kind, specText),
       ...(solved.detail?.path === undefined ? {} : { path: [...solved.detail.path] }),
       ...(solved.detail?.counterexample === undefined ? {} : { counterexample: solved.detail.counterexample }),
     });

@@ -123,7 +123,14 @@ export interface LoopHost {
   /** `p1 && p2 && …`, binding each left operand as a hypothesis for the right one. */
   conjoin(parts: readonly ExprIR[], ctx: Ctx, env: FnEnv, span: Span): ExprIR;
   /** Register an obligation site. */
-  site(kind: ObligationKind, span: Span, ctx: Ctx, goal: ExprIR, resultValue?: ExprIR): ObligationSite;
+  site(
+    kind: ObligationKind,
+    span: Span,
+    ctx: Ctx,
+    goal: ExprIR,
+    resultValue?: ExprIR,
+    specText?: string,
+  ): ObligationSite;
   /** A reference expression to a slot. */
   ref(slot: Slot, type: TypeIR, span: Span): ExprIR;
   /** The kernel type of a value of `type`, as a scope-aware builder. */
@@ -369,8 +376,12 @@ export function lowerLoop(host: LoopHost, request: LoopRequest): LoopIR | null {
     const invariantNew =
       invariants.length === 0 ? host.trueExpr(span) : conjoinTags(host, invariants, endCtx, endEnv, span);
     const measureNew = checkIntTag(host, measureTag, endCtx, endEnv, span) ?? host.intExpr(0n, span);
+    const invariantText = invariants
+      .map((tag) => tag.text.trim())
+      .filter((text) => text !== "")
+      .join(" && ");
     const sites: ObligationSite[] = [
-      host.site("invariant-preserve", span, endCtx, invariantNew),
+      host.site("invariant-preserve", span, endCtx, invariantNew, undefined, invariantText),
       host.site("measure-nonneg", span, endCtx, host.le(host.intExpr(0n, span), measureNew, span)),
       host.site("measure-decrease", span, endCtx, host.lt(measureNew, measureEntry ?? host.intExpr(0n, span), span)),
     ];
@@ -387,8 +398,12 @@ export function lowerLoop(host: LoopHost, request: LoopRequest): LoopIR | null {
   const invariantInit =
     invariants.length === 0 ? host.trueExpr(span) : conjoinTags(host, invariants, ctx, env, span);
   const measureInit = checkIntTag(host, measureTag, ctx, env, span) ?? host.intExpr(0n, span);
+  const invariantInitText = invariants
+    .map((tag) => tag.text.trim())
+    .filter((text) => text !== "")
+    .join(" && ");
   loop.initSites = [
-    host.site("invariant-init", span, ctx, invariantInit),
+    host.site("invariant-init", span, ctx, invariantInit, undefined, invariantInitText),
     host.site("measure-nonneg", span, ctx, host.le(host.intExpr(0n, span), measureInit, span)),
   ];
 
