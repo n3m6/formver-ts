@@ -12,6 +12,7 @@
  * otherwise argument-wise while skipping `irrelevant` positions (proof irrelevance).
  */
 import { irrelevantOf, lookupPrim } from "./builtins";
+import { isKnownEnv } from "./brand";
 import type { Env } from "./env";
 import { applyClosure, applyValue, evalTerm, fstOf, sndOf } from "./eval";
 import { formEquals, formOf } from "./linear";
@@ -21,6 +22,8 @@ import { vvar } from "./value";
 
 /** Definitional equality of two closed terms. Never throws; a kernel bug yields `false`. */
 export function isConvertible(env: Env, a: Term, b: Term): boolean {
+  // A fabricated environment could make anything convertible; refuse it.
+  if (!isKnownEnv(env)) return false;
   try {
     return convValue(env, 0, evalTerm(env, a, []), evalTerm(env, b, []));
   } catch {

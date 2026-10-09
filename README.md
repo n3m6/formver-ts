@@ -317,13 +317,35 @@ twice and counts the surviving checks in both outputs.
 - `.tsx` files are not processed (only `.ts` and `.mts`).
 - `bun:ffi` is marked experimental by Bun, and a native crash in Z3 would take the process down.
 
-Beyond the specification's list, two limitations are visible in the current implementation (both
-documented in [`docs/ELAB_NOTES.md`](docs/ELAB_NOTES.md)):
+Beyond the specification's list, these limitations are visible in the current implementation.
+Each is reported as a located diagnostic, never as a crash or a wrong verdict:
 
 - **Mutual recursion** between local functions is not supported; both functions are reported
   with an `error[internal]` naming the cycle.
-- A **loop-carried array/vector local** is rejected (`error[internal]: a vector type needs its
-  length`), because the loop state cannot carry the vector's length in the current encoding.
+- A **loop-carried array/vector local** is rejected with a located `error[fragment]`: the loop
+  state is a tuple of values and cannot carry the vector's length around the loop.
+- A **`readonly number[]`-valued local** (`const out = a.slice(0, n)`) is rejected, because the
+  kernel has no congruence rule for `get` over `slice`/`append` and so cannot derive element
+  ranges for a derived array. Vector locals with a **generic** element type
+  (`a: readonly T[]`) do verify and keep their length.
+- **Tagged unions** are limited to **two variants** with **`number` fields** (and their `InRange`
+  facts). Section 4.2 allows more; the encoding (a nested `Sum` of `Sigma` records) exists, but
+  the fragment checker only builds it for that shape.
+- **Union literals** (`{ kind: "a", v: x }`) are accepted where an expected union type is in
+  scope — currently a `return` position — but not yet as a `const` initializer or a call
+  argument. **Narrowing** works on a variable or field slot (`const u = us[0]; if (u.kind ===
+  "a")`), not directly on an index expression (`if (us[0].kind === "a")`).
+- **Nested loops** are rejected: a variable assigned by an outer loop cannot be updated after an
+  inner loop, and the outer loop's carried state is not threaded through the inner one.
+- `Math.max`, `Math.min` and `Math.abs` map to their kernel definitions (section 6.3), but the
+  kernel has no dependent case rule for `ifLe` on non-literal bounds, so a **range fact about
+  their result cannot be certified**: a function whose arithmetic uses them fails with
+  `error[range]`. Write the branch (`x < y ? y : x`) instead — that form certifies. `Math.floor`
+  and `Math.trunc` with a positive literal divisor do work, through `divFloor`/`divTrunc` and
+  their spec lemmas.
+- A function whose *declaration* is outside the fragment (a `boolean` return type, a missing
+  return type, `async`) is reported as `rejected`, but it can be absent from the per-function
+  verdict table, which lists the functions the extractor could build an IR for.
 
 ## Repository layout
 

@@ -154,10 +154,13 @@ export function keyOfValue(value: Value, irrelevantOf: IrrelevantOf): string {
 
 /**
  * Binders of a value spliced in from a closure's environment are named in a namespace of
- * their own.  Without it, a binder inside such a value and a binder of the term being
- * traversed could print the same `Bound(n)`, which would make two *different* values key
- * equally — and equal keys make `Le` conversion identify non-equivalent propositions, which
- * would let `Farkas` prove `Empty` (a soundness hole, not merely a completeness one).
+ * their own, and every substitution level extends it (`SUBSTITUTED` accumulates), so that
+ * binders belonging to *different* closures can never print the same `Bound(n)`.  Without
+ * that, two different values could key equally — and equal keys make `Le` conversion identify
+ * non-equivalent propositions, which would let `Farkas` prove `Empty` (a soundness hole, not
+ * merely a completeness one).  A fixed marker is not enough: a value substituted from one
+ * environment can itself contain a value substituted from another, and both would restart the
+ * numbering at zero.
  */
 const SUBSTITUTED = "\u0001";
 
@@ -252,7 +255,7 @@ function keyTerm(
       const slot = env.length - outer;
       const value = slot >= 0 && slot < env.length ? env[slot] : undefined;
       if (value === undefined) return `Free(${term.index})`;
-      return keyValue(value, 0, irrelevantOf, ns === "" ? SUBSTITUTED : ns);
+      return keyValue(value, 0, irrelevantOf, ns + SUBSTITUTED);
     }
     case "Sort":
       return `Sort(${term.level})`;

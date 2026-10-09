@@ -30,6 +30,12 @@ export type KernelErrorReason =
   | "farkas-not-a-le-hypothesis"
   | "farkas-unimplemented"
   | "farkas-invalid"
+  /** A term that is not a well-formed `Term` at all (untrusted callers build them). */
+  | "not-a-term"
+  /** A universe level that is not a non-negative safe integer. */
+  | "bad-level"
+  /** An environment that `emptyEnv`/`addDecl` did not build. */
+  | "unknown-environment"
   | "internal";
 
 export interface KernelError {

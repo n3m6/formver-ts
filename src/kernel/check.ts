@@ -16,6 +16,7 @@
  * variables that `conv.ts` invents cannot collide with the context.
  */
 import { lookupPrim, OP_EMPTY, OP_INT } from "./builtins";
+import { isKnownEnv, unknownEnvError } from "./brand";
 import { convValue } from "./conv";
 import type { Env } from "./env";
 import { err, internalError, kernelError, ok, type KernelError, type Result } from "./errors";
@@ -82,6 +83,16 @@ export function infer(ctx: Ctx, term: Term): Result<Value, KernelError> {
 
     case "Sort":
       // Type l : Type (l + 1). There is no Type : Type.
+      // Levels are concrete numbers, so they must be non-negative safe integers: without
+      // this check `Type 2^53 : Type 2^53` (float rounding), `Type 1.5 : Type 2.5` and
+      // `Type -Infinity : Type -Infinity` would all be accepted.
+      if (!Number.isSafeInteger(term.level) || term.level < 0 || !Number.isSafeInteger(term.level + 1)) {
+        return err(
+          kernelError("bad-level", `the universe level ${term.level} is not a non-negative safe integer`, {
+            term,
+          }),
+        );
+      }
       return ok(vsort(term.level + 1));
 
     case "Pi":
@@ -194,6 +205,17 @@ export function infer(ctx: Ctx, term: Term): Result<Value, KernelError> {
 
     case "Farkas":
       return inferFarkas(ctx, term.hyps, term.coeffs, term);
+
+    default:
+      // Unreachable for a well-formed `Term`; untrusted code builds these trees, and a
+      // malformed node must be rejected rather than crash the checker.
+      return err(
+        kernelError(
+          "not-a-term",
+          `unrecognized term node ${JSON.stringify((term as { tag?: unknown }).tag)}`,
+          {},
+        ),
+      );
   }
 }
 
@@ -372,6 +394,7 @@ function guard<T>(thunk: () => Result<T, KernelError>): Result<T, KernelError> {
 
 /** Infers the type of a closed term; the returned type is in normal form. */
 export function inferType(env: Env, term: Term): Result<Term, KernelError> {
+  if (!isKnownEnv(env)) return err(unknownEnvError());
   return guard(() => {
     const inferred = infer(emptyCtx(env), term);
     if (!inferred.ok) return inferred;
@@ -381,6 +404,7 @@ export function inferType(env: Env, term: Term): Result<Term, KernelError> {
 
 /** Checks a closed term against a closed type, which must itself be a well-formed type. */
 export function checkType(env: Env, term: Term, type: Term): Result<void, KernelError> {
+  if (!isKnownEnv(env)) return err(unknownEnvError());
   return guard(() => {
     const ctx = emptyCtx(env);
     const level = inferLevel(ctx, type);
@@ -391,5 +415,6 @@ export function checkType(env: Env, term: Term, type: Term): Result<void, Kernel
 
 /** Checks that a term is a well-formed type and returns its universe level. */
 export function isTypeTerm(env: Env, term: Term): Result<Level, KernelError> {
+  if (!isKnownEnv(env)) return err(unknownEnvError());
   return guard(() => inferLevel(emptyCtx(env), term));
 }

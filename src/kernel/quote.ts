@@ -9,6 +9,7 @@
  * `normalize` is the public `quote(eval(term))`.
  */
 import type { Env } from "./env";
+import { isKnownEnv, unknownEnvError } from "./brand";
 import { err, internalError, KernelInternalError, ok, type KernelError, type Result } from "./errors";
 import { applyClosure, evalTerm } from "./eval";
 import { OP_ADD, OP_MUL_CONST } from "./builtins";
@@ -108,6 +109,7 @@ function quoteHead(env: Env, depth: Level, head: Head): Term {
 
 /** `quote(eval(term))`: the definitional normal form of a term. */
 export function normalize(env: Env, term: Term): Result<Term, KernelError> {
+  if (!isKnownEnv(env)) return err(unknownEnvError());
   try {
     return ok(quote(env, 0, evalTerm(env, term, [])));
   } catch (cause) {

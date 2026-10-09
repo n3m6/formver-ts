@@ -12,6 +12,7 @@
  * checks its own built-ins and there is no back door into the environment.
  */
 import { builtinDecls } from "./builtins";
+import { brandEnv, isKnownEnv, unknownEnvError } from "./brand";
 import { checkType, isTypeTerm } from "./check";
 import { err, kernelError, KernelInternalError, ok, type KernelError, type Result } from "./errors";
 import type { Term } from "./term";
@@ -50,11 +51,41 @@ export interface Env {
 }
 
 /**
+ * The declaration table handed out by an `Env`.  It is a real `Map` for lookup speed, with
+ * its mutators disabled: a cast to `Map` must not be able to inject a declaration behind
+ * `addDecl`'s back (or hide an axiom from `axiomsUsed`).
+ */
+class SealedDecls extends Map<string, Decl> {
+  constructor(source: ReadonlyMap<string, Decl>) {
+    super();
+    // `super.set` on purpose: `new Map(iterable)` would call the throwing override.
+    for (const [key, value] of source) super.set(key, value);
+  }
+
+  override set(): this {
+    throw new KernelInternalError(
+      "the kernel environment is read-only; addDecl is the only way to insert a declaration",
+    );
+  }
+
+  override delete(): boolean {
+    throw new KernelInternalError("the kernel environment is read-only");
+  }
+
+  override clear(): void {
+    throw new KernelInternalError("the kernel environment is read-only");
+  }
+}
+
+/**
  * The starting environment: the built-in definitions of specification section 6.1.3,
  * inserted through `addDecl` so that they are kernel-checked. Zero axioms.
+ * Every environment it returns is branded (`brand.ts`): `Env` is structurally typed, so
+ * without the brand untrusted code could fabricate one and get declarations — including
+ * `axiom`s — accepted without ever passing through `addDecl`.
  */
 export function emptyEnv(): Env {
-  let env: Env = { decls: new Map(), order: [] };
+  let env: Env = brandEnv({ decls: new SealedDecls(new Map()), order: [] });
   for (const decl of builtinDecls()) {
     const added = addDecl(env, decl);
     if (!added.ok) {
@@ -73,6 +104,7 @@ export function emptyEnv(): Env {
  * error result, with no new environment to use).
  */
 export function addDecl(env: Env, decl: Decl): Result<Env, KernelError> {
+  if (!isKnownEnv(env)) return err(unknownEnvError());
   if (env.decls.has(decl.name)) {
     return err(
       kernelError("duplicate-decl", `the name ${decl.name} is already declared`, { name: decl.name }),
@@ -114,7 +146,7 @@ export function addDecl(env: Env, decl: Decl): Result<Env, KernelError> {
   }
   const decls = new Map(env.decls);
   decls.set(decl.name, decl);
-  return ok({ decls, order: [...env.order, decl.name] });
+  return ok(brandEnv({ decls: new SealedDecls(decls), order: [...env.order, decl.name] }));
 }
 
 export function lookupDecl(env: Env, name: string): Decl | undefined {
