@@ -356,6 +356,12 @@ export interface ImportedSpec {
 export interface SignatureIR {
   /** The full binder telescope, outermost first. */
   readonly binders: readonly Binder[];
+  /**
+   * The surface type of every value parameter, in the order of the `param` binders.  A call
+   * site needs them to check its arguments against the callee (section 4.2); callers can
+   * make no use of a parameter of a different type, directly or through a generic.
+   */
+  readonly paramTypes: readonly TypeIR[];
   /** Precondition facts, in tag order. */
   readonly preconditions: readonly FactIR[];
   readonly result: ResultIR;
@@ -1840,6 +1846,7 @@ function buildSignature(
 
   const signature: SignatureIR = {
     binders: ctx.binders,
+    paramTypes: params.map((param) => param.type),
     preconditions,
     result,
     type: telescopeType(ctx.binders, result.term),
@@ -2365,6 +2372,10 @@ class FnChecker implements LoopHost {
     this.reporter.error(span, message);
   }
 
+  substitute(expr: ExprIR, replace: (e: ExprIR) => ExprIR | null): ExprIR {
+    return substituteExpr(expr, replace);
+  }
+
   walk(stmts: readonly A.Stmt[], ctx: Ctx, env: FnEnv, k: Continuation, loop: LoopIR | null): StmtIR[] {
     const out: StmtIR[] = [];
     for (let i = 0; i < stmts.length; i += 1) {
@@ -2373,8 +2384,16 @@ class FnChecker implements LoopHost {
         case "Empty":
           continue;
         case "Block": {
-          const spliced = [...stmt.body, ...stmts.slice(i + 1)];
-          return [...out, ...this.walk(spliced, ctx, env, k, loop)];
+          // A statement-level block is not in section 4.2's accepted statement list, and
+          // splicing its statements into the enclosing list would leak its bindings: the
+          // elaborated term would then read a value the JavaScript cannot see (or, for a
+          // binding the block declares, one that does not exist at all).  Report it instead.
+          this.reporter.error(
+            stmt.span,
+            "a `{ }` block statement is not allowed in verified functions: a `let`/`const` declared in one would escape the block",
+          );
+          out.push({ kind: "nop", span: stmt.span });
+          return out;
         }
         case "VarDecl": {
           for (const declaration of stmt.declarations) {
@@ -2722,8 +2741,15 @@ class FnChecker implements LoopHost {
         }),
         [narrowing],
       );
-      const body = this.walk(switchCase.body, caseCtx, env, k, loop);
-      const last = switchCase.body[switchCase.body.length - 1];
+      // `case "a": { … }` writes braces around the case body: they group the case's
+      // statements (and are how the parser represents the case clause), so the block's
+      // statements are walked directly.  A block *inside* that list is still rejected.
+      const caseStmts =
+        switchCase.body.length === 1 && switchCase.body[0]!.kind === "Block"
+          ? switchCase.body[0]!.body
+          : switchCase.body;
+      const body = this.walk(caseStmts, caseCtx, env, k, loop);
+      const last = caseStmts[caseStmts.length - 1];
       if (last === undefined || last.kind !== "Return") {
         this.reporter.error(switchCase.span, "every case of a `switch` in a verified function must end with `return`");
       }
@@ -3502,6 +3528,34 @@ class FnChecker implements LoopHost {
     return { ...node, sites: [rangeSite] };
   }
 
+  /**
+   * Section 4.2: a call must pass a value of the callee's parameter type.  Checking it here
+   * keeps a wrong-type argument from reaching the kernel as an application of the wrong type
+   * (which surfaces as an `internal` diagnostic, or as a nonsensical counterexample on a
+   * precondition that mentions the parameter).
+   */
+  private checkCallArguments(
+    ast: A.CallExpr,
+    args: readonly ExprIR[],
+    params: readonly Binder[],
+    target: { name: string; signature: SignatureIR },
+  ): boolean {
+    let ok = true;
+    params.forEach((param, index) => {
+      const arg = args[index];
+      const expected = target.signature.paramTypes[index];
+      if (arg === undefined || expected === undefined) return;
+      if (argumentMatches(expected, arg.type)) return;
+      ok = false;
+      this.reporter.error(
+        ast.args[index]?.span ?? ast.span,
+        `\`${target.name}\` needs \`${typeText(expected)}\` for the parameter ` +
+          `\`${param.surface ?? param.name}\`, but the argument \`${renderExpr(arg)}\` has type \`${typeText(arg.type)}\``,
+      );
+    });
+    return ok;
+  }
+
   private callWithSignature(
     ast: A.CallExpr,
     ctx: Ctx,
@@ -3524,6 +3578,7 @@ class FnChecker implements LoopHost {
       );
       return null;
     }
+    if (!this.checkCallArguments(ast, args, params, target)) return null;
     // Instantiate the callee's preconditions: parameters become the argument expressions and
     // vector lengths become the arguments' lengths.
     const substitution = new Map<number, ExprIR>();
@@ -3748,6 +3803,47 @@ function typesMatch(a: TypeIR, b: TypeIR): boolean {
   if (a.kind === "union") return a.union!.name === b.union!.name && a.union!.file === b.union!.file;
   if (a.kind === "generic") return a.typeParam === b.typeParam;
   return true;
+}
+
+/**
+ * Can a value of type `arg` be passed where the parameter type `param` is expected?
+ *
+ * A `readonly T[]` parameter accepts an array of any accepted element type (the callee's
+ * `T` becomes it) and a bare `T` accepts any value type: instantiating a type parameter is
+ * the elaborator's job, and this check only rejects an argument of the wrong *shape*.
+ */
+function argumentMatches(param: TypeIR, arg: TypeIR): boolean {
+  switch (param.kind) {
+    case "int":
+      return arg.kind === "int";
+    case "boolean":
+      return arg.kind === "boolean";
+    case "vec":
+      return (
+        arg.kind === "vec" &&
+        (param.elem!.kind === "generic" ? arg.elem!.kind !== "boolean" : typesMatch(param.elem!, arg.elem!))
+      );
+    case "union":
+      return arg.kind === "union" && typesMatch(param, arg);
+    case "generic":
+      return arg.kind !== "boolean";
+  }
+}
+
+/** The surface type text a diagnostic names (`number`, `readonly number[]`, `U`, …). */
+function typeText(type: TypeIR): string {
+  switch (type.kind) {
+    case "int":
+      return "number";
+    case "boolean":
+      return "boolean";
+    case "vec":
+      return `readonly ${typeText(type.elem!)}[]`;
+    case "generic":
+      return type.typeParam ?? "T";
+    case "union":
+      return type.union?.name ?? "union";
+  }
 }
 
 /**

@@ -120,6 +120,12 @@ export interface LoopHost {
   ): StmtIR[];
   /** Report a located `fragment` error. */
   report(span: Span, message: string): void;
+  /**
+   * Replace the sub-expressions of `expr` for which `replace` returns a node.  Used to
+   * instantiate a loop's `@invariant`/`@decreases` with the values the carried variables
+   * have before the loop (the `invariant-init`/`measure-nonneg` obligations).
+   */
+  substitute(expr: ExprIR, replace: (e: ExprIR) => ExprIR | null): ExprIR;
   /** `p1 && p2 && …`, binding each left operand as a hypothesis for the right one. */
   conjoin(parts: readonly ExprIR[], ctx: Ctx, env: FnEnv, span: Span): ExprIR;
   /** Register an obligation site. */
@@ -214,8 +220,10 @@ export function desugarUpdate(update: A.Expr): A.Expr {
 
 /** The statement list a loop body runs: the body, plus a `for` loop's update. */
 export function loopBodyStatements(ast: A.WhileStmt | A.ForStmt): readonly A.Stmt[] {
-  if (ast.kind === "While") return [ast.body];
-  const body: A.Stmt[] = [ast.body];
+  // A loop body's braces belong to the loop statement, not to a statement-level block (which
+  // is rejected): the body's statements are walked directly.
+  const body: A.Stmt[] = ast.body.kind === "Block" ? [...ast.body.body] : [ast.body];
+  if (ast.kind === "While") return body;
   if (ast.update !== null) {
     body.push({ kind: "ExprStmt", expr: desugarUpdate(ast.update), span: ast.update.span });
   }
@@ -281,13 +289,30 @@ export function lowerLoop(host: LoopHost, request: LoopRequest): LoopIR | null {
     });
   }
   // A `for (let i = e; c; update)` declares its own carried variable; `update` always
-  // assigns it, so it is carried unconditionally.
+  // assigns it, so it is carried unconditionally.  Its scope is the loop *and its spec*, not
+  // the statements after the loop, so its name is remembered for the `rest` walk below.
+  const ownNames = new Set<string>();
   if (ast.kind === "For" && ast.init !== null && ast.init.kind === "VarDecl") {
     for (const declaration of ast.init.declarations) {
       if (declaration.init === undefined) continue;
-      if (carried.some((c) => c.name === declaration.name)) continue;
+      ownNames.add(declaration.name);
       const value = host.expression(declaration.init, ctx, env);
       if (value === null) continue;
+      if (needsProofTerm(value)) {
+        // The loop's start tuple is elaborated before the obligation proofs of the call
+        // (index, slice, …) in the initializer are available, so such a value cannot be a
+        // `for` counter.  Report it here — the function is rejected before elaboration, so
+        // the failure is one located `fragment` error instead of an `internal` one.
+        host.report(
+          declaration.span,
+          `the \`for\` loop's counter \`${declaration.name}\` cannot be initialized by an expression whose term needs an obligation proof (a call, \`a[i]\`, \`slice\` or a spread); bind it with a separate \`let\` before the loop`,
+        );
+      }
+      // A `for`'s own `let` shadows an outer variable of the same name for the whole loop
+      // (including the body's assignments), so it replaces it in the carried tuple: an
+      // assignment the mutation scan attributed to the outer name is really this one.
+      const shadowed = carried.findIndex((c) => c.name === declaration.name);
+      if (shadowed >= 0) carried.splice(shadowed, 1);
       carried.push({
         name: declaration.name,
         path: [],
@@ -318,12 +343,13 @@ export function lowerLoop(host: LoopHost, request: LoopRequest): LoopIR | null {
   const stateCtx = stateBind.ctx;
   const stateVar = K.varTerm(0);
 
+  // The loop's spec is checked with the carried variables bound to the loop state, so a
+  // `for` loop's own `let i` is in scope for its `@invariant`/`@decreases` (section 4.2).
+  const entryE = entryEnv(host, env, stateBind.binder, withPaths);
   const measureTag = decreases[0];
-  const measureEntry = checkIntTag(host, measureTag, stateCtx, entryEnv(host, env, stateBind.binder, withPaths), span);
+  const measureEntry = checkIntTag(host, measureTag, stateCtx, entryE, span);
   const invariantEntry =
-    invariants.length === 0
-      ? host.trueExpr(span)
-      : conjoinTags(host, invariants, stateCtx, entryEnv(host, env, stateBind.binder, withPaths), span);
+    invariants.length === 0 ? host.trueExpr(span) : conjoinTags(host, invariants, stateCtx, entryE, span);
   const invariantTerm = host.term(stateCtx, invariantEntry);
   const measureFn: Term = K.lam(
     "s",
@@ -402,13 +428,31 @@ export function lowerLoop(host: LoopHost, request: LoopRequest): LoopIR | null {
 
   loop.body = host.walk(bodyStmts, bodyCtx, bodyEnv, backEdge, loop);
   // The statements after the loop run *outside* the loop, so an assignment there is rejected
-  // (section 4.2 allows reassignment only inside a loop).
-  loop.rest = host.walk(rest, bodyCtx, bodyEnv, k, null);
+  // (section 4.2 allows reassignment only inside a loop).  A `for` loop's own `let i` is not
+  // in scope after the loop either: it is dropped from the environment (restoring an outer
+  // variable of the same name, which the loop's `let` had shadowed) so that reading it there
+  // is a located `fragment` error, exactly like the `ReferenceError` the JavaScript throws.
+  const restVars = new Map(bodyEnv.vars);
+  for (const name of ownNames) {
+    const outer = env.vars.get(name);
+    if (outer === undefined) restVars.delete(name);
+    else restVars.set(name, outer);
+  }
+  loop.rest = host.walk(rest, bodyCtx, { vars: restVars }, k, null);
 
   // ---- the init obligations, in the enclosing context ------------------------
-  const invariantInit =
-    invariants.length === 0 ? host.trueExpr(span) : conjoinTags(host, invariants, ctx, env, span);
-  const measureInit = checkIntTag(host, measureTag, ctx, env, span) ?? host.intExpr(0n, span);
+  // The obligation is the entry invariant (the measure) with every carried variable replaced
+  // by the value it has before the loop: `@invariant i <= n` at `for (let i = 0; …)` must be
+  // checked as `0 <= n`.  State components are refs into the state tuple the entry spec was
+  // checked against, so the substitution is spelled on those slots.
+  const initByPath = new Map<string, ExprIR>();
+  for (const variable of withPaths) initByPath.set(variable.path.join(","), variable.initial);
+  const replaceState = (e: ExprIR): ExprIR | null => {
+    if (e.kind !== "ref" || e.slot?.kind !== "state" || e.slot.state !== stateBind.binder) return null;
+    return initByPath.get(e.slot.path.join(",")) ?? null;
+  };
+  const invariantInit = host.substitute(invariantEntry, replaceState);
+  const measureInit = host.substitute(measureEntry ?? host.intExpr(0n, span), replaceState);
   const invariantInitText = invariants
     .map((tag) => tag.text.trim())
     .filter((text) => text !== "")
@@ -446,6 +490,31 @@ function loopVar(variable: Carried): LoopVarIR {
     type: variable.type,
     initial: variable.initial,
   };
+}
+
+/**
+ * Does building this expression's kernel term need an obligation proof?  A call to a
+ * verified function needs its `pre-call` proof, an `index` its bounds proof, and a `slice`
+ * or a spread theirs.  A prelude call (`Math.min`, …) and arithmetic do not.
+ */
+function needsProofTerm(e: ExprIR): boolean {
+  switch (e.kind) {
+    case "call":
+      return e.callee === undefined || e.callee.kind !== "prelude";
+    case "index":
+    case "slice":
+    case "append":
+      return true;
+    case "length":
+      // `x.length` is the vector's length expression, not the vector term.
+      return e.vecLength !== undefined && needsProofTerm(e.vecLength);
+    default:
+      if (e.args.some(needsProofTerm)) return true;
+      if (e.vecLength !== undefined && needsProofTerm(e.vecLength)) return true;
+      if (e.cond?.thenExpr !== undefined && needsProofTerm(e.cond.thenExpr)) return true;
+      if (e.cond?.elseExpr !== undefined && needsProofTerm(e.cond.elseExpr)) return true;
+      return false;
+  }
 }
 
 /** The carried-state tuple: `Sigma (v0 : T0). Sigma (v1 : T1). … Unit`. */
