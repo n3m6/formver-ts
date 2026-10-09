@@ -14,9 +14,10 @@
  */
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { verifyCached } from "./cache";
 import { formatDiagnostic, formatDiagnostics, type Diagnostic, type DiagnosticKind } from "./diagnostics";
 import { contentHash } from "./extract/specs";
-import { verify, type VerifyResult } from "./verify";
+import type { VerifyResult } from "./verify";
 import * as z3 from "./vc/z3";
 
 const USAGE = "usage: bun run verify [paths…] [--lenient]";
@@ -132,7 +133,11 @@ export function run(argv: readonly string[]): number {
     const absolute = resolve(file);
     if (seen.has(absolute)) continue;
     seen.add(absolute);
-    const result = verify(file, readFileSync(file, "utf8"), {
+    // Same content-addressed cache the plugin uses (section 6.5): the key covers the
+    // verifier's own sources, the strict flag, the solver, every transitively imported file
+    // and the file's contents, so a hit is the same report and `DEP_VERIFY_NO_CACHE=1`
+    // bypasses it in both directions.
+    const result = verifyCached(file, readFileSync(file, "utf8"), {
       strict: !options.lenient,
       verifyImports: true,
       solver: solverAvailable,
@@ -149,6 +154,12 @@ export function run(argv: readonly string[]): number {
     const printed = [...diagnostics, ...extra];
     if (printed.length > 0) console.log(printed.map(formatDiagnostic).join("\n"));
     if (printed.some((diagnostic) => diagnostic.severity === "error")) failure = true;
+    if (result.functions.length === 0) {
+      // Nothing was verified in this file.  Reporting it as "verified" would be a silent
+      // success: a user who names a file expects at least one annotated function in it.
+      console.error(`error: ${file}: no annotated function to verify (no @pre, @post or @decreases)`);
+      failure = true;
+    }
     if (result.axioms.length > 0) {
       console.error(`${file}: error[internal]: ${result.axioms.length} axiom(s) used: ${result.axioms.join(", ")}`);
       failure = true;
@@ -161,7 +172,10 @@ export function run(argv: readonly string[]): number {
 }
 
 /** The section 6.1.5 rule: every `external` must be certified in its own file under this hash. */
-function externalDiagnostics(result: VerifyResult, lenient: boolean): Diagnostic[] {
+function externalDiagnostics(
+  result: Pick<VerifyResult, "externals" | "path">,
+  lenient: boolean,
+): Diagnostic[] {
   const out: Diagnostic[] = [];
   for (const external of result.externals) {
     if (external.certified !== true) {
@@ -235,8 +249,12 @@ export function printSummary(summaries: readonly FileSummary[], solverAvailable:
   const axioms = total((summary) => summary.axioms);
   console.log(`axioms used: ${axioms}${axioms === 0 ? "" : " (must be 0)"}`);
   if (!solverAvailable) console.log("note: no SMT solver available; every obligation needs a runtime check");
-  // A trailing separator makes the table easy to spot in a long terminal log.
-  console.log(`${summaries.length} file(s) verified`);
+  // A trailing separator makes the table easy to spot in a long terminal log.  The function
+  // count matters on its own: a run over files with no annotated function verifies nothing.
+  const functions = total(
+    (summary) => summary.certified + summary.smtOnly + summary.failed + summary.rejected,
+  );
+  console.log(`${summaries.length} file(s) verified, ${functions} function(s) with a verdict`);
 }
 
 if (import.meta.main) {

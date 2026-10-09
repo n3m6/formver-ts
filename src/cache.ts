@@ -16,15 +16,18 @@
  * `DEP_VERIFY_NO_CACHE=1` bypasses the cache in both directions.  Everything here is
  * synchronous, because the plugin's `onLoad` must be (section 3.1 point 5).
  */
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { relative, resolve } from "node:path";
 import { contentHash, resolveImportPath } from "./extract/specs";
 import { parseFile } from "./syntax/parser";
 import { verify, type VerifyResult } from "./verify";
 import { isAvailable } from "./vc/z3";
 
-/** The cache format and verifier version.  Change it to invalidate every entry. */
-export const CACHE_VERSION = 1;
+/**
+ * The cache format version.  Bump it whenever the *shape* of an entry changes; a change in
+ * verification *semantics* is covered automatically by `verifierFingerprint()`.
+ */
+export const CACHE_VERSION = 2;
 
 /** `.dep-verify/cache/`, resolved from this file rather than from the process cwd. */
 export const CACHE_DIR: string = resolve(import.meta.dir, "..", ".dep-verify", "cache");
@@ -47,6 +50,13 @@ export interface VerifyCachedOptions {
    * what a run with one would prove.
    */
   readonly solver?: boolean;
+  /**
+   * Verify the imported files too, so a caller of an uncertified import is marked (section
+   * 6.5).  Defaults to the strict flag: strict mode's guarantee — every obligation
+   * kernel-certified, every imported spec certified in its own file — must not depend on
+   * which entry point (CLI, `bun run`, `Bun.build`) verified the file.
+   */
+  readonly verifyImports?: boolean;
 }
 
 export interface CachedVerifyReport extends VerifyReport {
@@ -60,6 +70,8 @@ interface CacheEntry {
   readonly path: string;
   readonly sourceHash: string;
   readonly imports: readonly (readonly [string, string])[];
+  /** `verifierFingerprint()` of the revision that wrote the entry. */
+  readonly fingerprint?: string;
   readonly report: VerifyReport;
 }
 
@@ -69,7 +81,11 @@ export function cacheDisabled(): boolean {
 }
 
 /**
- * `[path, contentHash]` for the file and every file it imports, transitively, sorted by path.
+ * `[path, contentHash]` for the file and **every** file it imports, transitively, sorted by
+ * path.  The whole reachable graph is hashed: the spec of a type alias re-exported through
+ * `mid.ts` (which `src/extract/specs.ts` resolves) would otherwise be invisible to the key
+ * and a stale *success* verdict could be served.  Cycles end at the `out.has` check.
+ *
  * Missing, unreadable and unresolvable imports are skipped: the verification itself reports
  * them, and the key must stay stable while they are broken.
  */
@@ -77,11 +93,9 @@ export function importedFileHashes(
   path: string,
   source: string,
   read: (file: string) => string = (file) => readFileSync(file, "utf8"),
-  limit = 64,
 ): [string, string][] {
   const out = new Map<string, string>();
-  const visit = (file: string, text: string, depth: number): void => {
-    if (depth > 8 || out.size >= limit) return;
+  const visit = (file: string, text: string): void => {
     let imports;
     try {
       imports = parseFile(file, text).imports;
@@ -98,23 +112,70 @@ export function importedFileHashes(
         continue;
       }
       out.set(target, contentHash(contents));
-      visit(target, contents, depth + 1);
+      visit(target, contents);
     }
   };
-  visit(path, source, 0);
+  visit(path, source);
   return [...out.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
 }
 
-/** The sha256 cache key: version, mode, the file's hash and every import's hash. */
+/**
+ * A fingerprint of this verifier's own sources.  A verdict is only reusable while the code
+ * that produced it is unchanged; `CACHE_VERSION` is a manual constant, so the fingerprint
+ * makes every edit to `src/**` invalidate every entry by itself.  Memoized per process.
+ */
+let fingerprint: string | undefined;
+
+export function verifierFingerprint(): string {
+  if (fingerprint !== undefined) return fingerprint;
+  const root = import.meta.dir; // src/
+  const files: string[] = [];
+  const walk = (dir: string): void => {
+    let entries;
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of [...entries].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))) {
+      const full = resolve(dir, entry.name);
+      if (entry.isDirectory()) walk(full);
+      else if (entry.isFile() && entry.name.endsWith(".ts")) files.push(full);
+    }
+  };
+  walk(root);
+  const hasher = new Bun.CryptoHasher("sha256");
+  for (const file of files) {
+    hasher.update(`${relative(root, file)}\n`);
+    try {
+      hasher.update(readFileSync(file));
+    } catch {
+      hasher.update("<unreadable>");
+    }
+    hasher.update("\n");
+  }
+  fingerprint = hasher.digest("hex");
+  return fingerprint;
+}
+
+/** Absolute path, so a relative and an absolute caller share one entry instead of thrashing. */
+function normalisePath(path: string): string {
+  return resolve(path);
+}
+
+/** The sha256 cache key: version, verifier sources, mode, the file's hash and every import's. */
 export function cacheKey(path: string, source: string, options: VerifyCachedOptions = {}): string {
   const imports = importedFileHashes(path, source, options.readFile);
   const hasher = new Bun.CryptoHasher("sha256");
   hasher.update(
     JSON.stringify([
       CACHE_VERSION,
+      verifierFingerprint(),
+      normalisePath(path),
       options.strict === true,
       options.timeoutMs ?? 0,
       options.solver ?? isAvailable(),
+      options.verifyImports ?? options.strict === true,
       contentHash(source),
       imports,
     ]),
@@ -153,8 +214,12 @@ function readEntry(file: string, key: string, path: string): VerifyReport | unde
   if (typeof parsed !== "object" || parsed === null) return undefined;
   const entry = parsed as Partial<CacheEntry>;
   if (entry.version !== CACHE_VERSION || entry.key !== key) return undefined;
+  // An entry from another revision of the verifier says nothing about this one.
+  if (entry.fingerprint !== verifierFingerprint()) return undefined;
   const report = entry.report;
-  if (!isReport(report) || report.path !== path) return undefined;
+  // Compare resolved paths: the plugin passes absolute paths and `scripts/demo.ts` relative
+  // ones, and both describe the same file.
+  if (!isReport(report) || normalisePath(report.path) !== normalisePath(path)) return undefined;
   return report;
 }
 
@@ -183,16 +248,18 @@ export function verifyCached(
   const file = resolve(cacheDir, `${key}.json`);
   if (!disabled) {
     const hit = readEntry(file, key, path);
-    if (hit !== undefined) return { ...hit, cached: true };
+    // The caller's own path, not the one the entry happened to be written with.
+    if (hit !== undefined) return { ...hit, path, cached: true };
   }
   const result = verify(path, source, {
     strict: options.strict ?? false,
     solver: options.solver ?? isAvailable(),
+    verifyImports: options.verifyImports ?? options.strict === true,
     ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
     ...(options.readFile === undefined ? {} : { readFile: options.readFile }),
   });
   const report: VerifyReport = {
-    path: result.path,
+    path,
     strict: result.strict,
     ok: result.ok,
     functions: result.functions,
@@ -205,10 +272,11 @@ export function verifyCached(
     writeEntry(file, {
       version: CACHE_VERSION,
       key,
-      path,
+      path: normalisePath(path),
       sourceHash: contentHash(source),
       imports: importedFileHashes(path, source, options.readFile),
-      report,
+      fingerprint: verifierFingerprint(),
+      report: { ...report, path: normalisePath(path) },
     });
   }
   return { ...report, cached: false };

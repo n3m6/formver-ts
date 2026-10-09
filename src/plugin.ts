@@ -21,7 +21,7 @@ import { readFileSync } from "node:fs";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import { verifyCached, type CachedVerifyReport } from "./cache";
 import { formatDiagnostics } from "./diagnostics";
-import { inject, InjectionError } from "./inject/inject";
+import { inject, InjectionError, isInjected } from "./inject/inject";
 
 /** The repository root, resolved from this file rather than from the process cwd. */
 export const REPO_ROOT: string = resolve(import.meta.dir, "..");
@@ -46,10 +46,13 @@ export function isOwnSource(path: string): boolean {
 export function strictFailureMessage(result: CachedVerifyReport): string {
   if (result.diagnostics.length > 0) return formatDiagnostics(result.diagnostics);
   const uncertified = result.functions.filter((fn) => !fn.certified).map((fn) => fn.name);
-  return (
-    `${result.path}: strict verification failed` +
-    (uncertified.length === 0 ? "" : `: \`${uncertified.join("`, `")}\` is not kernel-certified`)
-  );
+  const dependencies = [...new Set(result.functions.flatMap((fn) => fn.dependsOnUncertified))];
+  const problems: string[] = [];
+  if (uncertified.length > 0) problems.push(`\`${uncertified.join("`, `")}\` is not kernel-certified`);
+  if (dependencies.length > 0) {
+    problems.push(`the imported spec(s) \`${dependencies.join("`, `")}\` are not certified`);
+  }
+  return `${result.path}: strict verification failed${problems.length === 0 ? "" : `: ${problems.join("; ")}`}`;
 }
 
 export const depVerifyPlugin: BunPlugin = {
@@ -57,11 +60,13 @@ export const depVerifyPlugin: BunPlugin = {
   setup(builder) {
     builder.onLoad({ filter: FILTER }, (args) => {
       const source = readFileSync(args.path, "utf8");
-      if (isOwnSource(args.path) || !SPEC_TAG.test(source)) {
+      // An already-injected file is returned as it is: its `__dv` import is runtime
+      // scaffolding, not user code, so re-verifying it would report a bogus fragment error.
+      if (isOwnSource(args.path) || !SPEC_TAG.test(source) || isInjected(source)) {
         return { contents: source, loader: "ts" };
       }
       const strict = process.env.DEP_VERIFY_STRICT === "1";
-      const result = verifyCached(args.path, source, { strict });
+      const result = verifyCached(args.path, source, { strict, verifyImports: strict });
       if (strict && !result.ok) throw new Error(strictFailureMessage(result));
       if (result.diagnostics.length > 0) console.warn(formatDiagnostics(result.diagnostics));
       try {

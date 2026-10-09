@@ -156,6 +156,8 @@ class Parser {
   private readonly functions: A.FnDecl[] = [];
   private readonly typeAliases: A.TypeAliasDecl[] = [];
   private readonly imports: A.ImportDecl[] = [];
+  /** Local names an `export { … }` list exports (see `run()`). */
+  private readonly exportedNames = new Set<string>();
 
   constructor(
     private readonly tokens: Token[],
@@ -167,6 +169,16 @@ class Parser {
 
   run(): { functions: A.FnDecl[]; typeAliases: A.TypeAliasDecl[]; imports: A.ImportDecl[] } {
     while (!this.eof()) this.parseTopLevelItem();
+    // `export { f };` makes the local `f` callable from outside the module even though the
+    // declaration itself carries no `export` keyword.  Injection must know: what is reachable
+    // from outside the file keeps its boundary guards and its preconditions in production.
+    if (this.exportedNames.size > 0) {
+      for (let i = 0; i < this.functions.length; i += 1) {
+        const fn = this.functions[i]!;
+        if (fn.exported || !this.exportedNames.has(fn.name)) continue;
+        this.functions[i] = { ...fn, exported: true };
+      }
+    }
     return { functions: this.functions, typeAliases: this.typeAliases, imports: this.imports };
   }
 
@@ -257,6 +269,7 @@ class Parser {
     }
     let handled = false;
     if (this.tryParseImport()) handled = true;
+    else if (this.tryParseExportList()) handled = true;
     else if (this.tryParseTypeAlias()) handled = true;
     else if (this.tryParseFunction()) handled = true;
     if (!handled) this.skipTopLevelStatement();
@@ -410,6 +423,59 @@ class Parser {
       span: this.spanBetween(startToken.span, end.span),
       text: this.source.slice(startToken.span.offset, end.span.endOffset ?? end.span.offset),
     });
+    return true;
+  }
+
+  // --------------------------------------------------------------- export lists
+
+  /**
+   * `export { a, b as c };` — records the local names so `run()` can mark a local
+   * declaration exported.  A `from` clause re-exports another module's bindings and marks
+   * nothing.  `export default` and `export type { … }` are left to the other parsers.
+   */
+  private tryParseExportList(): boolean {
+    if (!this.isW("export")) return false;
+    const start = this.pos;
+    const after = this.at(1);
+    if (isWordToken(after, "default") || isWordToken(after, "type")) return false;
+    if (!isPunct(after, "{")) return false;
+    this.next(); // `export`
+    this.next(); // `{`
+    const locals: string[] = [];
+    while (!this.eof() && !this.isP("}")) {
+      if (this.cur.kind !== "ident") {
+        this.pos = start;
+        return false;
+      }
+      const local = this.next();
+      locals.push(local.text);
+      if (this.isW("as")) {
+        this.next();
+        if (this.cur.kind !== "ident") {
+          this.pos = start;
+          return false;
+        }
+        this.next();
+      }
+      if (this.isP(",")) this.next();
+      else break;
+    }
+    if (!this.isP("}")) {
+      this.pos = start;
+      return false;
+    }
+    this.next();
+    if (this.isW("from")) {
+      this.next();
+      if (this.cur.kind !== "string") {
+        this.pos = start;
+        return false;
+      }
+      this.next();
+    } else {
+      for (const name of locals) this.exportedNames.add(name);
+    }
+    this.consumeSemicolon();
     return true;
   }
 

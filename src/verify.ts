@@ -30,6 +30,9 @@ import * as K from "./kernel/index";
 import { elaborateFunction, type ObligationOutcome, type FunctionStatus } from "./extract/elaborate";
 import { extractFile, type FunctionIR, type ImportedSpec } from "./extract/fragment";
 import { contentHash, SpecResolver } from "./extract/specs";
+import { calledFromUnverifiedCode } from "./inject/inject";
+import { crosscheckFunction } from "./syntax/crosscheck";
+import { lex } from "./syntax/lexer";
 import { parseFile } from "./syntax/parser";
 import type { FnDecl } from "./syntax/ast";
 import { tagsNamed } from "./syntax/jsdoc";
@@ -120,6 +123,13 @@ export interface VerifyOptions {
    * to see the solver's own error messages.
    */
   readonly solver?: boolean;
+  /**
+   * The section 6.2 cross-check, for tests that need a doctored printer double.  Defaults to
+   * `crosscheckFunction`, which compares our parse against `Bun.Transpiler`.  Returning a
+   * diagnostic rejects the function as `internal`; it is never called for a function that
+   * already has a `parse` diagnostic inside its span.
+   */
+  readonly crosscheck?: (fn: FnDecl, source: string) => Diagnostic | null;
 }
 
 /**
@@ -137,6 +147,43 @@ export function verify(path: string, source: string, options: VerifyOptions = {}
   const verdicts: FunctionVerdict[] = [];
   const plan: InjectionRecord[] = [];
   const externals: ExternalUse[] = [];
+
+  // --- cross-check (section 6.2): our parse against Bun's, before the fragment check ------
+  // Every annotated function is cross-checked, unless the file has a `parse` error: inside
+  // the function there is nothing to compare, and one no function owns (at EOF after a
+  // truncated body, in unannotated code, …) means the token stream is not trustworthy, so
+  // every function of the file is rejected below without a redundant mismatch report.  A
+  // mismatch is an `internal` error and rejects the function: either our parser is wrong or
+  // the source is not valid TypeScript, and neither may be certified.
+  const crosscheck = options.crosscheck ?? crosscheckFunction;
+  const parseDiagnostics = parsed.diagnostics.filter((d) => d.kind === "parse");
+  const unownedParse = parseDiagnostics.filter(
+    (d) => !parsed.functions.some((decl) => declOwns(decl, d)),
+  );
+  const crosscheckRejected = new Map<string, Diagnostic[]>();
+  if (unownedParse.length === 0) {
+    for (const decl of parsed.functions) {
+      if (parseDiagnostics.some((d) => declOwns(decl, d))) continue;
+      let diagnostic: Diagnostic | null;
+      try {
+        diagnostic = crosscheck(decl, source);
+      } catch (error) {
+        diagnostic = {
+          kind: "internal",
+          severity: "error",
+          span: decl.span,
+          message: `cross-check threw for \`${decl.name}\`: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        };
+      }
+      if (diagnostic === null) continue;
+      diagnostics.push(diagnostic);
+      const own = crosscheckRejected.get(decl.name);
+      if (own === undefined) crosscheckRejected.set(decl.name, [diagnostic]);
+      else own.push(diagnostic);
+    }
+  }
 
   let ir;
   try {
@@ -190,14 +237,36 @@ export function verify(path: string, source: string, options: VerifyOptions = {}
 
   // --- which functions are rejected outright? --------------------------------------------
   const fileErrors = ir.diagnostics.filter((d) => d.severity === "error");
+  const parseErrors = fileErrors.filter((d) => d.kind === "parse");
+  const otherErrors = fileErrors.filter((d) => d.kind !== "parse");
+  // A `parse` error no annotated function owns (at EOF after a truncated body, in
+  // unannotated code, in an import, …) means the token stream every function was parsed
+  // from is not trustworthy.  It rejects every annotated function of the file: `parse` is
+  // only ever a syntax error, and a conservative rejection cannot certify broken input.
+  const fileLevelParse = parseErrors.filter(
+    (d) => !parsed.functions.some((decl) => declOwns(decl, d)),
+  );
   const declarations = new Map(parsed.functions.map((decl) => [decl.name, decl]));
   const byName = new Map(ir.functions.map((fn) => [fn.name, fn]));
   const rejected = new Map<string, Diagnostic[]>();
   for (const fn of ir.functions) {
     const decl = declarations.get(fn.name);
-    const own = fileErrors.filter((d) => functionOwns(fn, decl, d));
-    if (own.length > 0) rejected.set(fn.name, [...own]);
+    const own = otherErrors.filter((d) => functionOwns(fn, decl, d));
+    const ownParse = parseErrors.filter((d) => functionOwns(fn, decl, d));
+    const mismatched = crosscheckRejected.get(fn.name) ?? [];
+    const failed = [...own, ...ownParse, ...mismatched];
+    if (failed.length > 0) rejected.set(fn.name, failed);
   }
+  for (const fn of ir.functions) {
+    if (rejected.has(fn.name)) continue;
+    if (fileLevelParse.length > 0) rejected.set(fn.name, [...fileLevelParse]);
+  }
+
+  // --- which functions may be called from unverified code in this file? -------------------
+  // Section 6.6: those are the ones whose boundary assumptions (a `number` is a safe
+  // integer, an array is a real array) are not justified by a verified caller, so they keep
+  // a guard and their preconditions even in a production build.
+  const unverifiedCallers = calledFromUnverifiedCode(parsed, lex(source, path).tokens);
 
   // --- a rejected function's spec may still be used by callers (lenient mode) -------------
   for (const name of rejected.keys()) {
@@ -227,7 +296,7 @@ export function verify(path: string, source: string, options: VerifyOptions = {}
         obligations: [],
         dependsOnUncertified: [],
       });
-      plan.push(...planFor(fn, declarations.get(fn.name), "rejected"));
+      plan.push(...planFor(fn, declarations.get(fn.name), "rejected", unverifiedCallers));
       continue;
     }
     const outcome = elaborateFunction(env, fn, {
@@ -256,6 +325,7 @@ export function verify(path: string, source: string, options: VerifyOptions = {}
         fn,
         declarations.get(fn.name),
         outcome.result.certified ? "certified" : outcome.result.status,
+        unverifiedCallers,
         new Map(outcome.result.obligations.map((o) => [o.siteId, o])),
       ),
     );
@@ -278,7 +348,7 @@ export function verify(path: string, source: string, options: VerifyOptions = {}
       obligations: [],
       dependsOnUncertified: [],
     });
-    plan.push(...planFor(fn, declarations.get(fn.name), "failed"));
+    plan.push(...planFor(fn, declarations.get(fn.name), "failed", unverifiedCallers));
   }
 
   const axioms = K.axiomsUsed(env);
@@ -347,6 +417,18 @@ function functionOwns(fn: FunctionIR, decl: FnDecl | undefined, diagnostic: Diag
   if (spanContains(fn.span, diagnostic.span)) return true;
   if (spanContains(fn.nameSpan, diagnostic.span)) return true;
   if (decl?.jsdoc != null && spanContains(decl.jsdoc.span, diagnostic.span)) return true;
+  return false;
+}
+
+/**
+ * True when a diagnostic belongs to this declaration alone.  Used to attribute `parse`
+ * errors: one that no annotated declaration owns cannot be blamed on a specific function, so
+ * it rejects every annotated function of the file instead (section 6.5).
+ */
+function declOwns(decl: FnDecl, diagnostic: Diagnostic): boolean {
+  if (spanContains(decl.span, diagnostic.span)) return true;
+  if (spanContains(decl.nameSpan, diagnostic.span)) return true;
+  if (decl.jsdoc !== null && spanContains(decl.jsdoc.span, diagnostic.span)) return true;
   return false;
 }
 
@@ -446,18 +528,26 @@ function localCallees(fn: FunctionIR, byName: ReadonlyMap<string, FunctionIR>): 
  * The injection plan for one function: boundary guards, entry precondition checks, return
  * postcondition checks and one record per internal obligation site.  Milestone 8 owns the
  * actual injection; this is the data it needs.
+ *
+ * Guards are emitted for an exported function — its callers are unknown — and for a
+ * non-exported function that unverified code in the same file calls: the kernel type of that
+ * function assumes `InRange` for its `number` parameters, `readonly number[]` elements and
+ * union record fields, and only the guard makes those assumptions true at runtime
+ * (section 6.6).  Guards are always kept, in every mode.
  */
 function planFor(
   fn: FunctionIR,
   decl: FnDecl | undefined,
   status: Verdict,
+  unverifiedCallers: ReadonlySet<string>,
   obligations?: ReadonlyMap<number, ObligationOutcome>,
 ): InjectionRecord[] {
   const out: InjectionRecord[] = [];
   const certified = status === "certified";
   const paramText = new Map<string, string>();
   for (const param of decl?.params ?? []) paramText.set(param.name, param.typeText ?? "number");
-  if (fn.exported) {
+  const guarded = fn.exported || unverifiedCallers.has(fn.name);
+  if (guarded) {
     for (const param of fn.params) {
       out.push({
         function: fn.name,
@@ -537,6 +627,7 @@ function importCertified(spec: ImportedSpec, options: VerifyOptions): boolean | 
       readFile: options.readFile,
       verifyImports: false,
       solver: options.solver,
+      ...(options.crosscheck === undefined ? {} : { crosscheck: options.crosscheck }),
     });
     const verdict = result.functions.find((fn) => fn.name === spec.name);
     return verdict === undefined ? "unknown" : verdict.certified;

@@ -27,11 +27,7 @@ const WORD_UNARY: ReadonlySet<string> = new Set(["typeof", "void", "delete"]);
 
 /** Print a whole function declaration (without its JSDoc). */
 export function printFunction(fn: A.FnDecl): string {
-  const parts: string[] = [];
-  if (fn.exported) parts.push("export");
-  if (fn.async) parts.push("async");
-  let head = parts.length > 0 ? `${parts.join(" ")} function` : "function";
-  if (fn.generator) head += "*";
+  let head = functionHead(fn);
   head += ` ${fn.name}`;
   head += fn.typeParamsText !== undefined && fn.typeParamsText !== ""
     ? fn.typeParamsText
@@ -41,6 +37,21 @@ export function printFunction(fn: A.FnDecl): string {
   head += `(${fn.params.map(printParam).join(", ")})`;
   if (fn.returnTypeText !== undefined) head += `: ${fn.returnTypeText}`;
   return `${head} ${printBlock(fn.body, 0)}`;
+}
+
+/**
+ * `[export] [default] [async] function[*]`, taken from the verbatim declaration when we have
+ * it: `export { f }` also makes `f` exported, but prints (and Bun normalises) as a plain
+ * `function f`, and an `export default` must keep its `default` keyword.
+ */
+function functionHead(fn: A.FnDecl): string {
+  const modifiers =
+    fn.text === ""
+      ? [fn.exported ? "export" : "", fn.async ? "async" : ""].filter((part) => part !== "").join(" ")
+      : (/^(?:export\s+)?(?:default\s+)?(?:async\s+)?/.exec(fn.text)?.[0] ?? "").trim();
+  let head = modifiers === "" ? "function" : `${modifiers} function`;
+  if (fn.generator) head += "*";
+  return head;
 }
 
 export function printParam(param: A.Param): string {
@@ -154,12 +165,12 @@ export function printExpr(expr: A.Expr): string {
         .map((part) => (part.type === "text" ? part.raw : `\${${printExpr(part.expr)}}`))
         .join("")}\``;
     case "Member":
-      return `(${printExpr(expr.object)})${expr.optional ? "?." : "."}${expr.property}`;
+      return `${memberBase(expr.object)}${expr.optional ? "?." : "."}${expr.property}`;
     case "Index":
-      return `(${printExpr(expr.object)})${expr.optional ? "?.[" : "["}${printExpr(expr.index)}]`;
+      return `${memberBase(expr.object)}${expr.optional ? "?.[" : "["}${printExpr(expr.index)}]`;
     case "Call": {
       const typeArgs = expr.typeArgsText === undefined ? "" : expr.typeArgsText;
-      return `(${printExpr(expr.callee)})${expr.optional ? "?." : ""}${typeArgs}(${expr.args
+      return `${memberBase(expr.callee)}${expr.optional ? "?." : ""}${typeArgs}(${expr.args
         .map(printExpr)
         .join(", ")})`;
     }
@@ -184,7 +195,12 @@ export function printExpr(expr: A.Expr): string {
       const head = `${expr.async ? "async " : ""}(${expr.params.map(printParam).join(", ")})${
         expr.typeText === undefined ? "" : `: ${expr.typeText}`
       }`;
-      const body = expr.body.kind === "Block" ? printBlock(expr.body, 1) : printExpr(expr.body);
+      const body =
+        expr.body.kind === "Block"
+          ? printBlock(expr.body, 1)
+          : expr.body.kind === "ObjectLit"
+            ? `(${printExpr(expr.body)})` // otherwise `() => { a: 1 }` is a block with a label
+            : printExpr(expr.body);
       return `(${head} => ${body})`;
     }
     case "As":
@@ -205,6 +221,33 @@ export function printExpr(expr: A.Expr): string {
       return expr.text;
     default:
       return "";
+  }
+}
+
+/**
+ * The base of a member access, index or call.  Every expression is parenthesised so that Bun's
+ * printer decides what is redundant, with one exception: parentheses around a base whose
+ * top-level link is part of an **optional chain** are semantically significant
+ * (`(a?.b).c` throws when `a` is nullish; `a?.b.c` short-circuits the whole chain), and Bun
+ * keeps them in its output.  Since our AST does not record grouping parentheses, the
+ * unparenthesised form is the faithful printout for the source that reaches an annotated
+ * function (`a?.b.c`, `a?.[b].c`, `f?.(a).b` — all outside the verified fragment anyway).
+ */
+function memberBase(expr: A.Expr): string {
+  const text = printExpr(expr);
+  return openOptionalChain(expr) ? text : `(${text})`;
+}
+
+/** True when a further `.x`/`[x]`/`(x)` would continue this expression's optional chain. */
+function openOptionalChain(expr: A.Expr): boolean {
+  switch (expr.kind) {
+    case "Member":
+    case "Index":
+      return expr.optional || openOptionalChain(expr.object);
+    case "Call":
+      return expr.optional || openOptionalChain(expr.callee);
+    default:
+      return false;
   }
 }
 

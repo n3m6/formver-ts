@@ -31,6 +31,24 @@ import type { InjectionRecord } from "../verify";
 /** The runtime module every injected file imports (`src/inject/runtime.ts`). */
 export const RUNTIME_MODULE_PATH: string = resolve(import.meta.dir, "runtime.ts");
 
+/** The exact import line `inject()` prepends: it doubles as the idempotence marker. */
+export function runtimeImportText(runtimePath: string = RUNTIME_MODULE_PATH): string {
+  return `import * as __dv from ${JSON.stringify(runtimePath)};`;
+}
+
+/** A runtime import written with different spacing or quotes, from the same runtime module. */
+const RUNTIME_IMPORT = /import\s+\*\s+as\s+__dv\s+from\s+["'][^"'\n]*\/inject\/runtime\.ts["']/;
+
+/**
+ * True when a source has already been injected.  `inject()` returns such a source unchanged,
+ * and the plugin must not verify it either: the `__dv` import is unresolved user code to the
+ * fragment checker (section 6.7), so re-verifying an injected file reports bogus
+ * `error[fragment]: unresolved name __dv` — and strict mode makes it unloadable.
+ */
+export function isInjected(source: string, runtimePath: string = RUNTIME_MODULE_PATH): boolean {
+  return source.includes(runtimeImportText(runtimePath)) || RUNTIME_IMPORT.test(source);
+}
+
 /** Thrown when a required edit is impossible; `diagnostic` locates the failure. */
 export class InjectionError extends Error {
   readonly diagnostic: Diagnostic;
@@ -154,9 +172,9 @@ export function inject(source: string, plan: readonly InjectionRecord[], options
   if (plan.length === 0) return source;
   const path = options.path ?? plan[0]!.span.file;
   const runtimePath = options.runtimePath ?? RUNTIME_MODULE_PATH;
-  const importText = `import * as __dv from ${JSON.stringify(runtimePath)};`;
+  const importText = runtimeImportText(runtimePath);
   // Idempotent: a file that already imports the runtime module has been injected.
-  if (source.includes(importText)) return source;
+  if (isInjected(source, runtimePath)) return source;
   const parsed = options.parsed ?? parseFile(path, source, { includeUnannotated: true });
   const tokens = lex(source, path).tokens;
   const context: Context = {
@@ -282,23 +300,37 @@ function keepRecord(context: Context, record: InjectionRecord): boolean {
   return !context.productions || !record.certified;
 }
 
-/** Names called from outside every verified function: the "unverified code in this file". */
-function calledFromUnverifiedCode(parsed: A.ParsedFile, tokens: readonly Token[]): Set<string> {
+/**
+ * Names that unverified code in this file can reach: every call (`name(`) and every bare
+ * reference to a verified function's name outside its own span (`const alias = used;`,
+ * `export { used };`, `export default used;`) — an alias or an export list passes the
+ * function around without ever writing `used(`.  `verify()` uses the set to decide which
+ * non-exported functions need boundary guards (section 6.6) and `inject()` to decide which
+ * preconditions a production build keeps.  Being conservative is deliberate here: keeping a
+ * check that could have been dropped is harmless, dropping one is a soundness bug.
+ */
+export function calledFromUnverifiedCode(parsed: A.ParsedFile, tokens: readonly Token[]): Set<string> {
   const verified = parsed.functions.filter((fn) => fn.jsdoc !== null && fn.jsdoc.hasSpecTags);
   const spans = verified.map((fn) => fn.span);
+  const names = new Set(verified.map((fn) => fn.name));
   const out = new Set<string>();
   for (let i = 0; i < tokens.length; i += 1) {
     const token = tokens[i]!;
     if (token.kind !== "ident") continue;
-    const next = nextSignificant(tokens, i);
-    if (next === undefined || next.kind !== "punct" || next.text !== "(") continue;
-    // A declaration (`function f(…`, `class C(…)`) is not a call.
-    const previous = previousSignificant(tokens, i);
-    if (previous !== undefined && (previous.text === "function" || previous.text === "class")) continue;
     const inside = spans.some(
       (span) => token.span.offset >= span.offset && token.span.offset < (span.endOffset ?? span.offset),
     );
-    if (!inside) out.add(token.text);
+    if (inside) continue;
+    const next = nextSignificant(tokens, i);
+    if (next === undefined || next.kind !== "punct" || next.text !== "(") {
+      // Not a call, but a mention still reaches the function.
+      if (names.has(token.text)) out.add(token.text);
+      continue;
+    }
+    // A declaration (`function f(…`, `class C(…)`) is not a call.
+    const previous = previousSignificant(tokens, i);
+    if (previous !== undefined && (previous.text === "function" || previous.text === "class")) continue;
+    out.add(token.text);
   }
   return out;
 }

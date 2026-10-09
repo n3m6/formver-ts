@@ -277,6 +277,7 @@ heading(5, "runtime checks: `examples/runtime/main.ts` under the preload plugin"
 /** What a build must do with the checks whose marker is counted below (section 6.6). */
 const BUILD_MARKERS: readonly { marker: string; expectation: "kept" | "stripped"; note: string }[] = [
   { marker: "guardInt(", expectation: "kept", note: "boundary guard, exported `number` parameter" },
+  { marker: "guardIntArray(", expectation: "kept", note: "boundary guard, exported `readonly number[]` (every element)" },
   { marker: "guardArray(", expectation: "kept", note: "boundary guard, exported array parameter" },
   { marker: "new PreconditionError(\"", expectation: "kept", note: "`@pre` check of an exported function" },
   { marker: "new PostconditionError(\"", expectation: "stripped", note: "certified `@post` check" },
@@ -286,7 +287,8 @@ const BUILD_MARKERS: readonly { marker: string; expectation: "kept" | "stripped"
   { marker: "checkRange(", expectation: "stripped", note: "certified `range` obligation" },
   { marker: "checkPre(", expectation: "stripped", note: "certified `pre-call` obligation" },
   { marker: "checkInvariant(", expectation: "stripped", note: "certified loop invariant" },
-  { marker: "checkMeasureDecrease(", expectation: "stripped", note: "certified termination measure" },
+  { marker: "checkMeasure(", expectation: "stripped", note: "certified termination measure" },
+  { marker: "checkMeasureDecrease(", expectation: "stripped", note: "certified strict-decrease monitor" },
 ];
 
 function countOccurrences(text: string, marker: string): number {
