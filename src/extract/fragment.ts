@@ -414,7 +414,17 @@ export type StmtIR =
       readonly span: Span;
     }
   | { readonly kind: "return"; readonly value: ExprIR; readonly site: ObligationSite; readonly span: Span }
-  | { readonly kind: "switch"; readonly subject: Slot; readonly cases: readonly SwitchCaseIR[]; readonly span: Span }
+  | {
+      readonly kind: "switch";
+      readonly subject: Slot;
+      /**
+       * The union being discriminated.  Milestone 7 needs it to build the nested `Sum`
+       * case split (`sumAfter`/`sumInjection` are defined on the `UnionIR`, not on a case).
+       */
+      readonly union: UnionIR;
+      readonly cases: readonly SwitchCaseIR[];
+      readonly span: Span;
+    }
   | {
       readonly kind: "continue";
       readonly loop: LoopIR;
@@ -564,6 +574,20 @@ export interface TermOptions {
   readonly result?: Term;
   /** Proof terms for obligation sites, keyed by site id (milestone 7 fills these in). */
   readonly proofs?: ReadonlyMap<number, Term>;
+  /**
+   * Milestone 7 hook: a node whose kernel term needs more than this module can build from
+   * the IR alone.  `call` needs the callee's whole binder telescope (argument `InRange`
+   * proofs, bounds for the vector arguments, the callee's preconditions) and `append` needs
+   * one `Le (prefix + part) 4294967295` proof per spread part; the elaborator supplies both.
+   * Returning `undefined` falls through to the default (the prelude's `Math.*` calls, whose
+   * definitions this module builds itself, are never overridden).
+   */
+  readonly override?: (ctx: Ctx, e: ExprIR, opts: TermOptions) => Term | undefined;
+}
+
+/** The override hook, when the options carry one. */
+function overrideTerm(ctx: Ctx, e: ExprIR, opts?: TermOptions): Term | undefined {
+  return opts?.override?.(ctx, e, opts);
 }
 
 /** `fst`/`snd` path: `[0]` is `fst`, `[1,0]` is `fst` of `snd`, `[]` is the value itself. */
@@ -788,7 +812,7 @@ export function exprTerm(ctx: Ctx, e: ExprIR, opts?: TermOptions): Term {
       return K.Get(
         elemKernelType(ctx, vec.type.elem!),
         exprTerm(ctx, vec.vecLength!, opts),
-        rawTerm(ctx, vec, opts),
+        exprTerm(ctx, vec, opts),
         exprTerm(ctx, e.args[1]!, opts),
         proofFor(e, opts),
       );
@@ -798,20 +822,30 @@ export function exprTerm(ctx: Ctx, e: ExprIR, opts?: TermOptions): Term {
       return K.Slice(
         elemKernelType(ctx, vec.type.elem!),
         exprTerm(ctx, vec.vecLength!, opts),
-        rawTerm(ctx, vec, opts),
+        exprTerm(ctx, vec, opts),
         exprTerm(ctx, e.args[1]!, opts),
         exprTerm(ctx, e.args[2]!, opts),
         proofFor(e, opts),
       );
     }
     case "append": {
+      // The elaborator supplies the whole chain through the override hook: each step needs a
+      // `Le (prefix + part) 4294967295` proof, and only the last one is the site's.  Without
+      // the hook only a single spread can be built faithfully (the site's proof is about the
+      // whole concatenation), which is what this fallback does.  There is no empty vector
+      // value in the kernel, so the first part is the seed.
+      const custom = overrideTerm(ctx, e, opts);
+      if (custom !== undefined) return custom;
       const elem = elemKernelType(ctx, e.type.elem!);
       const proof = proofFor(e, opts);
-      let length: Term = K.intLit(0n);
-      let vec: Term = K.primTerm(K.OP_VEC, [elem, K.intLit(0n)]);
-      for (const part of e.args) {
+      const first = e.args[0];
+      if (first === undefined) throw new ExtractError("an array literal needs at least one spread part");
+      let length: Term = exprTerm(ctx, first.vecLength!, opts);
+      let vec: Term = exprTerm(ctx, first, opts);
+      for (let i = 1; i < e.args.length; i += 1) {
+        const part = e.args[i]!;
         const partLen = exprTerm(ctx, part.vecLength!, opts);
-        vec = K.Append(elem, length, partLen, vec, rawTerm(ctx, part, opts), proof);
+        vec = K.Append(elem, length, partLen, vec, exprTerm(ctx, part, opts), proof);
         length = K.Add(length, partLen);
       }
       return vec;
@@ -839,7 +873,12 @@ export function safePropTerm(ctx: Ctx, e: ExprIR, opts?: TermOptions): Term {
   }
 }
 
-/** The raw term of a node that denotes a packed value (the application of a call). */
+/**
+ * The term of a node whose packed result has to be kept packed: a `projection` node picks a
+ * component out of a call's `Sigma` result, so the call must not be unpacked here.  Anything
+ * else (a vector argument of `get`/`slice`/`append`, a spread part) is an ordinary value
+ * term, which is what `exprTerm` builds.
+ */
 function rawTerm(ctx: Ctx, e: ExprIR, opts?: TermOptions): Term {
   if (e.kind === "call") return callApplication(ctx, e, opts);
   return exprTerm(ctx, e, opts);
@@ -848,6 +887,8 @@ function rawTerm(ctx: Ctx, e: ExprIR, opts?: TermOptions): Term {
 function callApplication(ctx: Ctx, e: ExprIR, opts?: TermOptions): Term {
   const callee = e.callee!;
   if (callee.kind === "prelude") return callee.builtin!.build(e.args.map((arg) => exprTerm(ctx, arg, opts)));
+  const custom = overrideTerm(ctx, e, opts);
+  if (custom !== undefined) return custom;
   return K.appMany(
     K.constTerm(callee.name),
     e.args.map((arg) => exprTerm(ctx, arg, opts)),
@@ -2513,9 +2554,21 @@ class FnChecker implements LoopHost {
         : refExpr({ kind: "result" }, result.type, stmt.span);
     const parts: ExprIR[] = [];
     if (result.shape === "int") parts.push(inRangeOf({ kind: "result" }, stmt.span));
+    // `result.length` is the result *binder* (`m : Int`) in the codomain, but a body
+    // obligation lives outside that binder: substitute the returned vector's length (or the
+    // returned value, for the `int` shape) for it, exactly like `result` itself.
+    const resultBinderId = result.binder?.id;
     for (const post of result.posts) {
       parts.push(substituteExpr(post.prop, (e) => {
         if (e.kind === "ref" && e.slot?.kind === "result") return resultExpr;
+        if (
+          resultBinderId !== undefined &&
+          e.kind === "ref" &&
+          e.slot?.kind === "binder" &&
+          e.slot.binder.id === resultBinderId
+        ) {
+          return result.shape === "vec" ? checked.vecLength ?? null : checked;
+        }
         return null;
       }));
     }
@@ -2602,7 +2655,7 @@ class FnChecker implements LoopHost {
         this.reporter.error(stmt.span, `the switch must cover the variant ${JSON.stringify(variant.tag)}`);
       }
     }
-    return { kind: "switch", subject, cases, span: stmt.span };
+    return { kind: "switch", subject, union, cases, span: stmt.span };
   }
 
   // ---- expressions ----------------------------------------------------------
