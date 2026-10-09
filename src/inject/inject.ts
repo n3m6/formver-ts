@@ -226,7 +226,12 @@ function injectFunction(context: Context, name: string, records: readonly Inject
   const kept = records.filter((record) => keepRecord(context, record));
   if (kept.length === 0) return;
   const index = buildIndex(decl.body);
-  injectEntry(context, decl, kept);
+  // A loop's decrease monitor keeps state per source location, so a *second* call of the
+  // same function must not see the first call's last measure: the function entry clears it.
+  const loopMeasure = kept.some(
+    (record) => record.kind === "measure-decrease" && index.loopAt.has(record.span.offset),
+  );
+  injectEntry(context, decl, kept, loopMeasure);
   injectReturns(context, decl, index, kept);
   injectLoops(context, decl, index, kept);
   for (const record of kept) {
@@ -320,8 +325,14 @@ function nextSignificant(tokens: readonly Token[], index: number): Token | undef
 // Entry: guards, then `@pre`
 // ---------------------------------------------------------------------------
 
-function injectEntry(context: Context, decl: A.FnDecl, kept: readonly InjectionRecord[]): void {
+function injectEntry(
+  context: Context,
+  decl: A.FnDecl,
+  kept: readonly InjectionRecord[],
+  resetLoopMeasures: boolean,
+): void {
   const parts: string[] = [];
+  if (resetLoopMeasures) parts.push(`__dv.resetMeasures(${quote(decl.name)});`);
   for (const record of kept) {
     if (record.isBoundaryGuard) parts.push(guardCall(context, decl, record));
   }

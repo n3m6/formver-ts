@@ -473,6 +473,32 @@ function hypsAt(hyps: readonly Hyp[], depth: number): Hyp[] {
   return hyps.map((hyp) => hypAt(hyp, depth));
 }
 
+/** A proof of one site, in one context: the context is the chain of binders it was solved in. */
+interface ProofEntry {
+  readonly term: Term;
+  readonly binders: readonly number[];
+}
+
+/** The binder ids of a context, outermost first: its identity for the proof store. */
+function binderIds(ctx: Ctx): number[] {
+  return ctx.binders.map((binder) => binder.id);
+}
+
+/**
+ * The key a site's proof is stored under: the site, in one specific context.  Two contexts
+ * with the same depth are different places (the sibling arms of a duplicated condition, say),
+ * so the whole binder chain is the key.
+ */
+function proofKey(siteId: number, ctx: Ctx): string {
+  return `${siteId}@${binderIds(ctx).join(",")}`;
+}
+
+/** One branch of an elaborated condition: its context and the hypotheses in scope there. */
+interface ConditionLeaf {
+  readonly ctx: Ctx;
+  readonly hyps: readonly Hyp[];
+}
+
 /**
  * Drop repeated hypotheses.  The key is the *proposition* (and the depth), not the proof: a
  * fact the walk derived and the same fact the extractor recorded have different proofs but
@@ -614,16 +640,18 @@ class Elaborator {
   private readonly options: ElaborateOptions;
   private readonly diagnostics: Diagnostic[] = [];
   /**
-   * Proof per site id, with the depth it was built at.  A site's proof is a term in the site's
-   * own context; using it deeper (the `index` proof that a later `elems_a i p` fact needs, for
-   * example) requires weakening it, which `proofAt` does.  A placeholder sits here for a site
-   * that is not certified.
+   * One proof per (site, context): a site reached in two *different* contexts (the duplicated
+   * arm of an `===` condition is elaborated once per shape it appears in) gets one
+   * certificate per context, because a proof term mentions the hypotheses of the context it
+   * was solved in.  `ctx` identifies a context by the binders on the way to it, so a proof
+   * can be reused in an extension of its context (shifted) but never in a sibling one.
    */
-  private readonly proofs = new Map<number, { readonly term: Term; readonly depth: number }>();
-  /** `proofsAt` memoises one shifted view per depth; a new proof invalidates them all. */
-  private readonly proofViews = new Map<number, ReadonlyMap<number, Term>>();
+  private readonly proofs = new Map<number, ProofEntry[]>();
   private readonly outcomes = new Map<number, ObligationOutcome>();
-  private readonly visited = new Set<number>();
+  /** `siteId@context`: which (site, context) pairs were already solved. */
+  private readonly visited = new Set<string>();
+  /** Site ids whose failure was already turned into a diagnostic. */
+  private readonly reported = new Set<number>();
   /** Hypotheses of the expression currently being built (the `override` hook reads this). */
   private activeHyps: readonly Hyp[] = [];
   /** Built call applications, keyed by the call node (see `callInfo`). */
@@ -786,48 +814,55 @@ class Elaborator {
     return shiftTerm(bound.type, ctx.binders.length - at);
   }
 
-  /** The proof of a site, weakened from the depth it was built at to `depth`. */
-  private proofAt(siteId: number, depth: number): Term | undefined {
-    const entry = this.proofs.get(siteId);
-    if (entry === undefined) return undefined;
-    if (entry.depth === depth) return entry.term;
-    if (entry.depth > depth) {
-      throw new ElaborateFailure(
-        `the proof of obligation ${siteId} was built at depth ${entry.depth} and cannot be used at depth ${depth}`,
-      );
+  /**
+   * The proof of a site, read in `ctx`.
+   *
+   * A proof is a term of the context it was solved in, so it can be reused where that
+   * context is in scope again: in the *same* context, or in an extension of it, where
+   * `shiftTerm` moves its variables to the matching binders.  A *sibling* context (the two
+   * shapes an `===` condition's duplicated arm is elaborated in, say) needs its own
+   * certificate, which `certifySite` solves and stores for that context.
+   */
+  private proofAt(ctx: Ctx, siteId: number): Term | undefined {
+    const entries = this.proofs.get(siteId);
+    if (entries === undefined) return undefined;
+    const ids = binderIds(ctx);
+    let best: ProofEntry | undefined;
+    for (const entry of entries) {
+      if (entry.binders.length > ids.length) continue;
+      if (!entry.binders.every((id, index) => ids[index] === id)) continue;
+      if (best === undefined || entry.binders.length > best.binders.length) best = entry;
     }
-    return shiftTerm(entry.term, depth - entry.depth);
+    if (best === undefined) return undefined;
+    return best.binders.length === ids.length
+      ? best.term
+      : shiftTerm(best.term, ids.length - best.binders.length);
   }
 
-  /** The proof of one of a recursive call's measure obligations, weakened to `depth`. */
-  private selfCallProof(e: ExprIR, kind: ObligationKind, depth: number): Term {
+  /** The proof of one of a recursive call's measure obligations, read in `ctx`. */
+  private selfCallProof(ctx: Ctx, e: ExprIR, kind: ObligationKind): Term {
     const site = e.sites.find((candidate) => candidate.kind === kind);
     if (site === undefined) throw new ElaborateFailure(`a recursive call has no \`${kind}\` obligation`);
-    const proof = this.proofAt(site.id, depth);
+    const proof = this.proofAt(ctx, site.id);
     if (proof === undefined) {
       throw new ElaborateFailure(`the ${kind} obligation of this recursive call was not certified`);
     }
     return proof;
   }
 
-  /** Record a site's proof, keeping the shallowest one (it can be weakened to any deeper use). */
-  private storeProof(siteId: number, term: Term, depth: number): void {
-    const existing = this.proofs.get(siteId);
-    if (existing !== undefined && existing.depth <= depth) return;
-    this.proofs.set(siteId, { term, depth });
-    this.proofViews.clear();
-  }
-
-  /** The whole store, weakened to `depth` (what `exprTerm` reads for `index`/`slice`/`append`). */
-  private proofsAt(depth: number): ReadonlyMap<number, Term> {
-    const cached = this.proofViews.get(depth);
-    if (cached !== undefined) return cached;
-    const view = new Map<number, Term>();
-    for (const [id, entry] of this.proofs) {
-      view.set(id, entry.depth === depth ? entry.term : shiftTerm(entry.term, depth - entry.depth));
+  /** Record a site's proof for the context it was solved in. */
+  private storeProof(siteId: number, term: Term, ctx: Ctx): void {
+    const binders = binderIds(ctx);
+    const entries = this.proofs.get(siteId);
+    if (entries === undefined) {
+      this.proofs.set(siteId, [{ term, binders }]);
+      return;
     }
-    this.proofViews.set(depth, view);
-    return view;
+    const same = entries.findIndex(
+      (entry) => entry.binders.length === binders.length && entry.binders.every((id, i) => id === binders[i]),
+    );
+    if (same >= 0) entries[same] = { term, binders };
+    else entries.push({ term, binders });
   }
 
   /** The next extractor position along the current path. */
@@ -1181,7 +1216,7 @@ class Elaborator {
   private elementRangeHyp(ctx: Ctx, fact: FactIR, opts: TermOptions, depth: number): Hyp | null {
     const node = fact.prop.args[0];
     if (node === undefined || node.kind !== "index" || node.siteId === undefined) return null;
-    const proof = this.proofAt(node.siteId, depth);
+    const proof = this.proofAt(ctx, node.siteId);
     if (proof === undefined) return null;
     const vec = node.args[0];
     const index = node.args[1];
@@ -1249,7 +1284,7 @@ class Elaborator {
 
   private optionsFor(extra?: { result?: Term }): TermOptions {
     const base: TermOptions = {
-      proofAt: (siteId, depth) => this.proofAt(siteId, depth),
+      proofAt: (siteId, at) => this.proofAt(at, siteId),
       override: (ctx, e, opts) => this.overrideTerm(ctx, e, opts),
       inlineSlots: (ctx, slot) => this.inlineSlotTerm(ctx, slot),
     };
@@ -1344,7 +1379,7 @@ class Elaborator {
       paramInfo.set(binder.id, { term: exprTerm(ctx, expr, opts), expr });
     });
 
-    const preProofs = this.preCallProofs(e, depth);
+    const preProofs = this.preCallProofs(ctx, e);
     const typeArgs = this.typeArguments(ctx, signature, e.args);
     const applied = new Map<number, Term>();
     const ordered: Term[] = [];
@@ -1416,8 +1451,8 @@ class Elaborator {
       const frame = this.recursion;
       if (frame === null) throw new ElaborateFailure("a recursive call outside a recursive function");
       const state = this.packTuple(frame.spec, ctx, tupleValues);
-      const nonneg = this.selfCallProof(e, "measure-nonneg", depth);
-      const decrease = this.selfCallProof(e, "measure-decrease", depth);
+      const nonneg = this.selfCallProof(ctx, e, "measure-nonneg");
+      const decrease = this.selfCallProof(ctx, e, "measure-decrease");
       packed = K.appMany(K.varTerm(deBruijnIndex(ctx, frame.ih)), [state, nonneg, decrease, ...preProofs]);
     } else {
       packed = K.appMany(K.constTerm(callee.name), ordered);
@@ -1520,7 +1555,7 @@ class Elaborator {
   }
 
   /** The pre-call site's proof, split into one proof per precondition binder. */
-  private preCallProofs(e: ExprIR, depth: number): Term[] {
+  private preCallProofs(ctx: Ctx, e: ExprIR): Term[] {
     const callee = e.callee;
     const count = callee === undefined || callee.kind === "prelude" ? 0 : (this.signatureOf(callee)?.preconditions.length ?? 0);
     const site = e.sites.find((s) => s.kind === "pre-call");
@@ -1528,7 +1563,7 @@ class Elaborator {
       if (count === 0) return [];
       throw new ElaborateFailure("the call has preconditions but no pre-call obligation");
     }
-    const proof = this.proofAt(site.id, depth);
+    const proof = this.proofAt(ctx, site.id);
     if (proof === undefined) throw new ElaborateFailure("the pre-call obligation of this call was not certified");
     const out: Term[] = [];
     for (let i = 0; i < count; i += 1) {
@@ -1645,7 +1680,7 @@ class Elaborator {
   private appendTerm(ctx: Ctx, e: ExprIR, opts: TermOptions): Term {
     const elem = this.elemType(ctx, e.type.elem!);
     const site = e.sites.find((s) => s.kind === "append-length");
-    const siteProof = site === undefined ? undefined : this.proofAt(site.id, ctx.binders.length);
+    const siteProof = site === undefined ? undefined : this.proofAt(ctx, site.id);
     if (siteProof === undefined) throw new ElaborateFailure("the append-length obligation was not certified");
 
     const parts = e.args;
@@ -1792,7 +1827,7 @@ class Elaborator {
     const out: Hyp[] = [];
     for (const site of e.sites) {
       if (site.kind !== "range") continue;
-      const proof = this.proofAt(site.id, depth);
+      const proof = this.proofAt(ctx, site.id);
       if (proof === undefined) continue;
       try {
         out.push({ term: exprTerm(ctx, site.goal, opts), proof, depth, origin: "range" });
@@ -1870,11 +1905,17 @@ class Elaborator {
     opts: TermOptions,
     result?: Term,
   ): boolean {
-    if (this.visited.has(site.id)) return this.outcomes.get(site.id)?.status === "certified";
-    this.visited.add(site.id);
+    const key = proofKey(site.id, ctx);
+    if (this.visited.has(key)) return this.outcomes.get(site.id)?.status === "certified";
+    this.visited.add(key);
     const solved = this.solve(ctx, hyps, site, opts, result);
-    this.storeProof(site.id, solved.proof ?? K.tt, ctx.binders.length);
-    this.record(site, solved.status, solved.detail);
+    this.storeProof(site.id, solved.proof ?? K.tt, ctx);
+    // A site solved in two contexts is certified only when *both* are: a failure in either
+    // one leaves a hole in the term it belongs to.
+    const previous = this.outcomes.get(site.id);
+    if (previous === undefined || previous.status !== "failed" || solved.status === "failed") {
+      this.record(site, solved.status, solved.detail);
+    }
     if (solved.status === "certified") return true;
     this.reportFailure(site, solved);
     return false;
@@ -1886,7 +1927,7 @@ class Elaborator {
    * that branch's hypothesis).  The site is certified only when *every* branch is.
    */
   private certifyPost(ctx: Ctx, hyps: readonly Hyp[], site: ObligationSite, value: Term): Term {
-    this.visited.add(site.id);
+    this.visited.add(proofKey(site.id, ctx));
     const solved = this.solve(ctx, hyps, site, this.optionsFor(), value);
     const previous = this.outcomes.get(site.id);
     if (previous === undefined || previous.status === "certified" || solved.status !== "certified") {
@@ -1968,6 +2009,10 @@ class Elaborator {
     site: ObligationSite,
     solved: { status: ObligationStatus; detail?: SolveDetail },
   ): void {
+    // A site solved in two contexts (the duplicated arm of an `===` condition) fails in
+    // both; the location is the same, so it is reported once.
+    if (this.reported.has(site.id)) return;
+    this.reported.add(site.id);
     if (solved.status === "smt-only") {
       this.diagnostics.push({
         kind: "uncertified",
@@ -2069,7 +2114,7 @@ class Elaborator {
   private sweep(ctx: Ctx, hyps: readonly Hyp[]): void {
     const opts = this.optionsFor();
     for (const site of this.fn.sites) {
-      if (this.visited.has(site.id)) continue;
+      if (this.outcomes.has(site.id)) continue;
       this.certifySite(ctx, hyps, site, opts);
     }
   }
@@ -2185,8 +2230,8 @@ class Elaborator {
     const start = this.packTuple(spec, ctx, initial);
     const nonneg = loop.initSites.find((site) => site.kind === "measure-nonneg");
     const init = loop.initSites.find((site) => site.kind === "invariant-init");
-    const p0 = nonneg === undefined ? K.tt : this.proofAt(nonneg.id, depth) ?? K.tt;
-    const hinv0 = init === undefined ? K.tt : this.proofAt(init.id, depth) ?? K.tt;
+    const p0 = nonneg === undefined ? K.tt : this.proofAt(ctx, nonneg.id) ?? K.tt;
+    const hinv0 = init === undefined ? K.tt : this.proofAt(ctx, init.id) ?? K.tt;
 
     const loopTerm = K.FixWf(0, stateType, predicate, measureFn, step, start, p0);
     void bodyDepth;
@@ -2304,7 +2349,7 @@ class Elaborator {
     const proofOf = (kind: ObligationKind): Term => {
       const site = stmt.sites.find((candidate) => candidate.kind === kind);
       if (site === undefined) throw new ElaborateFailure(`the back edge has no ${kind} obligation`);
-      const proof = this.proofAt(site.id, ctx.binders.length);
+      const proof = this.proofAt(ctx, site.id);
       if (proof === undefined) throw new ElaborateFailure(`the ${kind} obligation of the back edge is missing`);
       return proof;
     };
@@ -2729,7 +2774,6 @@ class Elaborator {
   private elabReturnValue(ctx: Ctx, hyps: readonly Hyp[], valueExpr: ExprIR, site: ObligationSite): Term {
     if (valueExpr.kind === "cond" && valueExpr.cond !== undefined) {
       const cond = valueExpr.cond;
-      const depth = ctx.binders.length;
       const conditionFacts = this.withHyps(hyps, () => this.prepare(ctx, hyps, cond.expr, this.optionsFor()));
       const base = [...hyps, ...conditionFacts];
       const opts = this.optionsFor();
@@ -2756,34 +2800,16 @@ class Elaborator {
           },
         ]);
       }
-      const [a, b] = this.ifLeOperands(ctx, cond.expr, opts);
-      const thenBinder = this.branchBinder(cond.thenBinder, K.Le(a, b));
-      const elseBinder = this.branchBinder(cond.elseBinder, K.Lt(b, a));
-      const thenTerm = this.elabReturnValue(
-        this.pushExt(ctx, thenBinder),
-        [
-          ...hypsAt(base, depth + 1),
-          { term: shiftTerm(K.Le(a, b), 1), proof: K.varTerm(0), depth: depth + 1, origin: "condition" },
-        ],
-        cond.thenExpr,
-        site,
-      );
-      const elseTerm = this.elabReturnValue(
-        this.pushExt(ctx, elseBinder),
-        [
-          ...hypsAt(base, depth + 1),
-          { term: shiftTerm(K.Lt(b, a), 1), proof: K.varTerm(0), depth: depth + 1, origin: "condition" },
-        ],
-        cond.elseExpr,
-        site,
-      );
-      return K.IfLe(
-        0,
+      const thenExpr = cond.thenExpr;
+      const elseExpr = cond.elseExpr;
+      return this.conditionTerm(
+        ctx,
+        base,
+        cond,
+        opts,
         motive,
-        a,
-        b,
-        K.lam(cond.thenBinder.name, K.Le(a, b), thenTerm),
-        K.lam(cond.elseBinder.name, K.Lt(b, a), elseTerm),
+        (leaf) => this.elabReturnValue(leaf.ctx, leaf.hyps, thenExpr, site),
+        (leaf) => this.elabReturnValue(leaf.ctx, leaf.hyps, elseExpr, site),
       );
     }
 
@@ -2913,7 +2939,6 @@ class Elaborator {
 
   private elabIf(ctx: Ctx, hyps: readonly Hyp[], stmt: Extract<StmtIR, { kind: "if" }>): Term {
     const cond = stmt.cond;
-    const depth = ctx.binders.length;
     const conditionFacts = this.withHyps(hyps, () => this.prepare(ctx, hyps, cond.expr, this.optionsFor()));
     const base = [...hyps, ...conditionFacts];
 
@@ -2937,34 +2962,14 @@ class Elaborator {
       ]);
     }
 
-    const [a, b] = this.ifLeOperands(ctx, cond.expr, this.optionsFor());
-    const thenBinder = this.branchBinder(cond.thenBinder, K.Le(a, b));
-    const elseBinder = this.branchBinder(cond.elseBinder, K.Lt(b, a));
-    const thenCtx = this.pushExt(ctx, thenBinder);
-    const elseCtx = this.pushExt(ctx, elseBinder);
-    const thenTerm = this.elabStmts(
-      thenCtx,
-      [
-        ...hypsAt(base, depth + 1),
-        { term: shiftTerm(K.Le(a, b), 1), proof: K.varTerm(0), depth: depth + 1, origin: "condition" },
-      ],
-      stmt.then,
-    );
-    const elseTerm = this.elabStmts(
-      elseCtx,
-      [
-        ...hypsAt(base, depth + 1),
-        { term: shiftTerm(K.Lt(b, a), 1), proof: K.varTerm(0), depth: depth + 1, origin: "condition" },
-      ],
-      stmt.otherwise,
-    );
-    return K.IfLe(
-      0,
+    return this.conditionTerm(
+      ctx,
+      base,
+      cond,
+      this.optionsFor(),
       this.resultTypeAt(ctx),
-      a,
-      b,
-      K.lam(cond.thenBinder.name, K.Le(a, b), thenTerm),
-      K.lam(cond.elseBinder.name, K.Lt(b, a), elseTerm),
+      (leaf) => this.elabStmts(leaf.ctx, leaf.hyps, stmt.then),
+      (leaf) => this.elabStmts(leaf.ctx, leaf.hyps, stmt.otherwise),
     );
   }
 
@@ -3088,6 +3093,117 @@ class Elaborator {
   }
 
   // ---- helpers ------------------------------------------------------------
+
+  /**
+   * One branch of an integer condition: the context and the hypotheses the branch's term is
+   * elaborated in.  A branch that does not depend on the second comparison of `===`/`!==` is
+   * elaborated once per shape it appears in.
+   */
+  private conditionTerm(
+    ctx: Ctx,
+    base: readonly Hyp[],
+    cond: CondIR,
+    opts: TermOptions,
+    motive: Term,
+    then: (leaf: ConditionLeaf) => Term,
+    otherwise: (leaf: ConditionLeaf) => Term,
+  ): Term {
+    const depth = ctx.binders.length;
+    const [a, b] = this.ifLeOperands(ctx, cond.expr, opts);
+    const thenBinder = this.branchBinder(cond.thenBinder, K.Le(a, b));
+    const elseBinder = this.branchBinder(cond.elseBinder, K.Lt(b, a));
+    const thenCtx = this.pushExt(ctx, thenBinder);
+    const elseCtx = this.pushExt(ctx, elseBinder);
+    const thenHyp: Hyp = {
+      term: shiftTerm(K.Le(a, b), 1),
+      proof: K.varTerm(0),
+      depth: depth + 1,
+      origin: "condition",
+    };
+    const elseHyp: Hyp = {
+      term: shiftTerm(K.Lt(b, a), 1),
+      proof: K.varTerm(0),
+      depth: depth + 1,
+      origin: "condition",
+    };
+    const thenLeaf: ConditionLeaf = { ctx: thenCtx, hyps: [...hypsAt(base, depth + 1), thenHyp] };
+    const elseLeaf: ConditionLeaf = { ctx: elseCtx, hyps: [...hypsAt(base, depth + 1), elseHyp] };
+
+    // `ifLe a b` decides `a <= b`: `<`, `<=`, `>` and `>=` are exactly that (`ifLeOperands`).
+    if (cond.expr.kind !== "eq" && cond.expr.kind !== "neq") {
+      return K.IfLe(
+        0,
+        motive,
+        a,
+        b,
+        K.lam(thenBinder.name, K.Le(a, b), then(thenLeaf)),
+        K.lam(elseBinder.name, K.Lt(b, a), otherwise(elseLeaf)),
+      );
+    }
+
+    // `===` and `!==` need **both** comparisons, so the arm that a single `ifLe` cannot
+    // express is elaborated in the two shapes it can appear in:
+    //
+    //   a === b   ⟺   ifLe a b (λh. ifLe b a (λh'. then) else) else
+    //   a !== b   ⟺   ifLe a b (λh. ifLe b a (λh'. else) then) then
+    //
+    // The outer comparison splits `a <= b` from `a > b`; the inner one splits that into
+    // `b <= a` (equal) and `a < b`.  The `else` arm is therefore elaborated twice for `===`
+    // (and the `then` arm twice for `!==`), with the hypotheses of each occurrence — the
+    // same discipline an `&&`-normalized `if` already follows.  Each occurrence needs its
+    // own hypothesis *binder*: the binder's kernel domain is what the SMT context reports
+    // for it, and the two occurrences assume different hypotheses.
+    const innerDomain = K.Le(shiftTerm(b, 1), shiftTerm(a, 1));
+    const innerNoDomain = K.Lt(shiftTerm(a, 1), shiftTerm(b, 1));
+    const innerYesBinder = this.branchBinder({ ...cond.thenBinder, id: freshId() }, innerDomain);
+    const innerNoBinder = this.branchBinder({ ...cond.thenBinder, id: freshId() }, innerNoDomain);
+    const innerBase = hypsAt(base, depth + 2);
+    const outerThenAt2 = hypAt(thenHyp, depth + 2);
+    const innerYesHyp: Hyp = {
+      term: shiftTerm(innerDomain, 1),
+      proof: K.varTerm(0),
+      depth: depth + 2,
+      origin: "condition",
+    };
+    const innerNoHyp: Hyp = {
+      term: shiftTerm(innerNoDomain, 1),
+      proof: K.varTerm(0),
+      depth: depth + 2,
+      origin: "condition",
+    };
+    const equalArm = cond.expr.kind === "eq" ? then : otherwise;
+    const unequalArm = cond.expr.kind === "eq" ? otherwise : then;
+    // The *shallow* occurrence of the duplicated arm is elaborated first, so the walk stays
+    // in source order; each occurrence is solved in its own context either way.
+    const unequalElse = unequalArm(elseLeaf);
+    const equalInner = equalArm({
+      ctx: pushed(thenCtx, innerYesBinder),
+      hyps: [...innerBase, outerThenAt2, innerYesHyp],
+    });
+    const unequalInner = unequalArm({
+      ctx: pushed(thenCtx, innerNoBinder),
+      hyps: [...innerBase, outerThenAt2, innerNoHyp],
+    });
+    const inner = K.IfLe(
+      0,
+      // The inner `ifLe` sits one binder deeper than the outer one, so the result type (the
+      // `ifLe`'s motive, a term of the outer context) has to be shifted past the outer
+      // hypothesis binder.
+      shiftTerm(motive, 1),
+      shiftTerm(b, 1),
+      shiftTerm(a, 1),
+      K.lam(innerYesBinder.name, innerDomain, equalInner),
+      K.lam(innerNoBinder.name, innerNoDomain, unequalInner),
+    );
+    return K.IfLe(
+      0,
+      motive,
+      a,
+      b,
+      K.lam(thenBinder.name, K.Le(a, b), inner),
+      K.lam(elseBinder.name, K.Lt(b, a), unequalElse),
+    );
+  }
 
   /** `[a, b]` for `ifLe`, mirroring `fragment.ts`'s private `ifLeOperands`. */
   private ifLeOperands(ctx: Ctx, cond: ExprIR, opts: TermOptions): [Term, Term] {

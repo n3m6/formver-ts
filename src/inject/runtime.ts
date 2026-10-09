@@ -247,16 +247,32 @@ export function checkMeasure(measure: number, name: string, text: string, loc: s
  * A loop decrease monitor.  A `while` body is a single point per iteration, so the helper
  * remembers the measure it saw at this source location and requires every later visit to be
  * strictly smaller (the first visit is the loop's initialization).  Injected only for loops
- * whose function is not recursive, so one activation of the loop can never overlap another.
+ * whose function is not recursive, so one activation of the loop can never overlap another;
+ * `resetMeasures` at the function's entry is what keeps one *call* from seeing the memory of
+ * the previous one (the runtime module is shared by every call).
  */
 const measureMemory = new Map<string, number>();
+
+/** The key one function's measure monitor for one loop head lives under. */
+function measureKey(name: string, loc: string): string {
+  return `${name}\u0000${loc}`;
+}
+
+/** Forget every measure this function has seen: called once at its entry. */
+export function resetMeasures(name: string): void {
+  const prefix = `${name}\u0000`;
+  for (const key of [...measureMemory.keys()]) {
+    if (key.startsWith(prefix)) measureMemory.delete(key);
+  }
+}
 
 export function checkMeasureDecrease(measure: number, name: string, text: string, loc: string): number {
   if (typeof measure !== "number" || !Number.isSafeInteger(measure) || measure < 0) {
     throw new ObligationError("measure-nonneg", name, text, { measure }, loc);
   }
-  const previous = measureMemory.get(loc);
-  measureMemory.set(loc, measure);
+  const key = measureKey(name, loc);
+  const previous = measureMemory.get(key);
+  measureMemory.set(key, measure);
   if (previous !== undefined && measure >= previous) {
     throw new ObligationError("measure-decrease", name, text, { measure, previous }, loc);
   }

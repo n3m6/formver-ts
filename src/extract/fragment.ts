@@ -575,12 +575,12 @@ export interface TermOptions {
   /** Proof terms for obligation sites, keyed by site id (milestone 7 fills these in). */
   readonly proofs?: ReadonlyMap<number, Term>;
   /**
-   * Milestone 7 hook: the proof of `siteId` *as used at `depth` binders*.  A site's proof is
-   * built in the context of the site, so using it deeper (typically the `index` proof a later
-   * `elems_a i p` fact applies) requires weakening it; a plain `proofs` map cannot say that.
-   * Consulted before `proofs`.
+   * Milestone 7 hook: the proof of `siteId` *as used in `ctx`*.  A site's proof is built in
+   * the context of the site, so using it elsewhere (typically the `index` proof a later
+   * `elems_a i p` fact applies) requires weakening it — and a *sibling* context needs its own
+   * certificate; a plain `proofs` map cannot say either.  Consulted before `proofs`.
    */
-  readonly proofAt?: (siteId: number, depth: number) => Term | undefined;
+  readonly proofAt?: (siteId: number, ctx: Ctx) => Term | undefined;
   /**
    * Milestone 7 hook: a node whose kernel term needs more than this module can build from
    * the IR alone.  `call` needs the callee's whole binder telescope (argument `InRange`
@@ -618,7 +618,7 @@ function proofFor(ctx: Ctx, e: ExprIR, opts: TermOptions | undefined): Term {
   const proof =
     id === undefined
       ? undefined
-      : opts?.proofAt?.(id, ctx.binders.length) ?? opts?.proofs?.get(id);
+      : opts?.proofAt?.(id, ctx) ?? opts?.proofs?.get(id);
   if (proof === undefined) {
     throw new ExtractError(
       `the term for \`${e.kind}\` needs the proof of obligation site #${id ?? "?"}; pass it in TermOptions.proofs`,
