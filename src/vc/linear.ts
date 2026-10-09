@@ -664,21 +664,27 @@ export function leOfEq(
   forward: boolean,
   extra: number,
 ): K.Term {
-  const from = shift(forward ? equality.lhs : equality.rhs, extra);
-  const to = shift(forward ? equality.rhs : equality.lhs, extra);
-  // `fun (b' : Int) => fun (_ : Eq Int from b') => Le from b'`: the inner domain lives under
-  // `b'` alone (`from` lifted by one, `b'` at index 0), the body under both.  The domain used
-  // to be written for the deeper context, which the kernel rejects.
+  // `J` transports along `Eq Int lhs b'`, so its index is always the equality's *left* side
+  // and the proof has exactly the type it already has: `Eq Int lhs rhs`.  Which `Le`
+  // direction comes out is decided by the motive alone — `Le lhs b'` for the forward
+  // direction, `b' lhs` for the backward one — and both have the same base case
+  // `Le lhs lhs`.  (Transposing `from`/`to` instead, as this used to do, handed `J` a proof
+  // of the *reversed* equality, which the kernel rejects: it is what broke every loop
+  // obligation whose invariant contains `===`.)
+  const lhs = shift(equality.lhs, extra);
+  const rhs = shift(equality.rhs, extra);
+  // `fun (b' : Int) => fun (_ : Eq Int lhs b') => Le lhs b'` / `Le b' lhs`: the inner domain
+  // lives under `b'` alone (`lhs` lifted by one, `b'` at index 0), the body under both.
   const motive = K.lam(
     "_b",
     K.Int,
     K.lam(
       "_h",
-      K.Eq(K.Int, shift(from, 1), K.varTerm(0)),
-      K.Le(shift(from, 2), K.varTerm(1)),
+      K.Eq(K.Int, shift(lhs, 1), K.varTerm(0)),
+      forward ? K.Le(shift(lhs, 2), K.varTerm(1)) : K.Le(K.varTerm(1), shift(lhs, 2)),
     ),
   );
-  return K.J(0, K.Int, from, motive, leRefl(from), to, proof);
+  return K.J(0, K.Int, lhs, motive, leRefl(lhs), rhs, proof);
 }
 
 /**

@@ -27,8 +27,13 @@ file                    certified   smt-only     failed   rejected
 examples/pass/clamp.ts          1          0          0          0
 total                           1          0          0          0
 axioms used: 0
-1 file(s) verified
+1 file(s) verified, 1 function(s) with a verdict
 ```
+
+A requested file with no annotated function is an error (`no annotated function to verify`),
+so a typo in a path or a forgotten JSDoc tag cannot look like success. Results are cached by
+content hash under `.dep-verify/`, so a second `bun run verify` is near-instant;
+`DEP_VERIFY_NO_CACHE=1` disables the cache.
 
 The same plugin runs under `bun run`, under `bun test` (preloaded) and inside `Bun.build`. It
 injects **runtime checks** for anything the kernel did not certify, editing only within existing

@@ -119,7 +119,7 @@ function certifyObligation(env: K.Env, obligation: Obligation, opts: CertifyOpti
     env,
     depth,
     atoms: new S.AtomTable(env, depth),
-    timeoutMs: opts.timeoutMs ?? Z.DEFAULT_TIMEOUT_MS,
+    timeoutMs: Z.effectiveTimeout(opts.timeoutMs),
     atomNames: obligation.atomNames ?? {},
     ctx: obligation.context === undefined ? undefined : ctx,
   };
@@ -726,9 +726,9 @@ function checkValidity(
   const modelReply = Z.evalScript(withModel.script, { timeoutMs: amb.timeoutMs });
   if (!modelReply.ok) return { kind: "unknown", reason: modelReply.error ?? "the model query failed" };
   const model = S.decodeModel(modelReply.output);
-  if (Object.keys(model).length === 0) {
-    return { kind: "unknown", reason: `Z3 answered sat but produced no model (${JSON.stringify(modelReply.output)})` };
-  }
+  // `sat` is itself the proof that the obligation does not hold — the model is only there to
+  // *explain* it, and an obligation whose goal mentions no atom (a closed false proposition)
+  // has an empty model. Reporting "unknown" for it would hide a real invalidity.
   return { kind: "invalid", counterexample: counterexampleOf(amb, model) };
 }
 

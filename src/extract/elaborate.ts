@@ -132,6 +132,30 @@ export interface ElaborationOutcome {
 class ElaborateFailure extends Error {}
 
 /**
+ * True when the kernel's complaint is about a placeholder an *undischarged* obligation left
+ * in the term, not about the elaborated term itself.
+ *
+ * An obligation that is `smt-only` — Z3 proved it but produced no Farkas certificate, or no
+ * solver was available at all — has no proof term, so the hole is filled with `tt`, the only
+ * proof this module can build without a certificate.  The kernel's bidirectional checker then
+ * stops at the first `tt` used as a proof of a real proposition, reporting
+ * `expected …, but got Unit()` and naming that `tt` as the offending term.  That rejection is
+ * a consequence of the *incompleteness* of the term, so it must not be reported as an
+ * `internal` error (the verdict stays `smt-only`), while a rejection of anything else is a
+ * genuine elaboration bug and is always reported.
+ *
+ * Note the asymmetry: a bug that hides *behind* such a placeholder is not detected (the
+ * checker stops at the placeholder).  That is why the placeholder is only accepted for a
+ * term that already has an undischarged obligation.
+ */
+function placeholderRejection(error: K.KernelError): boolean {
+  const term = error.term;
+  if (term === undefined || term.tag !== "Prim" || term.op !== K.OP_TT) return false;
+  const actual = error.actual;
+  return actual !== undefined && actual.tag === "Prim" && actual.op === K.OP_UNIT;
+}
+
+/**
  * Ids for the binders this module synthesises (the value bound for a `@post`, the
  * hypotheses of a case split).  They are **negative** so that they can never collide with
  * the extractor's per-file ids, which start at 1: `deBruijnIndex` and `sameSlot` compare
@@ -750,13 +774,21 @@ class Elaborator {
     const smtOnly = this.noSolver || [...this.outcomes.values()].some((o) => o.status === "smt-only");
     const checked = K.checkType(this.env, term, this.fn.signature.type);
     if (!checked.ok) {
-      if (smtOnly) return this.finish("smt-only", term);
-      this.internal(
-        this.fn.nameSpan,
-        `the kernel rejected the elaborated term of \`${this.fn.name}\`: ${K.formatKernelError(checked.error)}` +
-          (checked.error.term === undefined ? "" : ` || at ${K.formatTerm(checked.error.term)}`),
-      );
-      return this.finish("failed", term);
+      // A kernel rejection of a complete term is a bug in this module and is always reported
+      // as such, whatever the solver situation: a `smt-only` verdict must never hide one.
+      // The one exception is an *incomplete* term — an obligation that was not discharged
+      // left a `tt` placeholder where a proof is required, so the kernel's complaint about
+      // that very placeholder says nothing about the rest of the term (see
+      // `placeholderRejection`).
+      if (!(smtOnly && placeholderRejection(checked.error))) {
+        this.internal(
+          this.fn.nameSpan,
+          `the kernel rejected the elaborated term of \`${this.fn.name}\`: ${K.formatKernelError(checked.error)}` +
+            (checked.error.term === undefined ? "" : ` || at ${K.formatTerm(checked.error.term)}`),
+        );
+        return this.finish("failed", term);
+      }
+      return this.finish("smt-only", term);
     }
     return this.finish(smtOnly ? "smt-only" : "certified", term);
   }
@@ -1573,11 +1605,28 @@ class Elaborator {
     return out;
   }
 
-  /** Inferred type arguments for a generic callee, from the call's argument types. */
+  /**
+   * Inferred type arguments for a generic callee, from the call's argument types.
+   *
+   * A generic parameter may only be used as an array element type (section 4.2), so the
+   * binder of a `readonly T[]` parameter has the kernel type `Vec T n`: its first argument
+   * names the type-parameter binder this argument position fixes, and the *argument's*
+   * extractor type gives the value — `number` elements give `Int`, a union alias gives its
+   * `Sum` encoding, and an argument that is itself a `readonly U[]` parameter of the caller
+   * gives the caller's type parameter `U` (whatever it is called; the previous name-based
+   * match only worked when caller and callee happened to use the same name).
+   *
+   * The name-based fallback below stays for the shapes the structural pass cannot read: an
+   * argument whose type mentions the callee's type parameter by name, and a bare `T`
+   * parameter (which the extractor tolerates although the fragment only allows `T` as an
+   * element type).  Neither can help when the argument is a concrete vector and the
+   * parameter is a bare `T`: the length that `T` would have to be is not in the `TypeIR`.
+   */
   private typeArguments(ctx: Ctx, signature: SignatureIR, args: readonly ExprIR[]): Map<number, Term> {
-    const out = new Map<number, Term>();
+    const out = this.typeArgumentsFromParameters(ctx, signature, args);
     for (const binder of signature.binders) {
       if (binder.role !== "type-param") continue;
+      if (out.has(binder.id)) continue;
       const name = binder.surface ?? binder.name;
       for (const arg of args) {
         const term = this.typeArgumentFor(ctx, arg.type, name);
@@ -1588,6 +1637,86 @@ class Elaborator {
       }
     }
     return out;
+  }
+
+  /** The type arguments the callee's own parameter types fix, argument by argument. */
+  private typeArgumentsFromParameters(
+    ctx: Ctx,
+    signature: SignatureIR,
+    args: readonly ExprIR[],
+  ): Map<number, Term> {
+    const out = new Map<number, Term>();
+    let argument = 0;
+    for (let position = 0; position < signature.binders.length; position += 1) {
+      if (signature.binders[position]!.role !== "param") continue;
+      const arg = args[argument];
+      argument += 1;
+      // Fewer arguments than parameters is reported by the caller; there is nothing to fix here.
+      if (arg === undefined) break;
+      const shape = this.parameterTypeParameter(signature, position);
+      if (shape === undefined || out.has(shape.binder.id)) continue;
+      const value = shape.array ? this.typeArgumentForElement(ctx, arg.type) : this.typeArgumentForType(ctx, arg.type);
+      if (value !== undefined) out.set(shape.binder.id, value);
+    }
+    return out;
+  }
+
+  /**
+   * The type parameter a parameter's kernel type is made of: `Vec T n` gives `{ array: true }`,
+   * a bare `T` gives `{ array: false }`, anything else `undefined`.
+   */
+  private parameterTypeParameter(
+    signature: SignatureIR,
+    position: number,
+  ): { binder: Binder; array: boolean } | undefined {
+    const binder = signature.binders[position];
+    if (binder === undefined) return undefined;
+    const type = binder.type;
+    if (type.tag === "Prim" && type.op === K.OP_VEC && type.args.length === 2) {
+      const element = this.typeParameterAt(signature, position, type.args[0]!);
+      return element === undefined ? undefined : { binder: element, array: true };
+    }
+    const bare = this.typeParameterAt(signature, position, type);
+    return bare === undefined ? undefined : { binder: bare, array: false };
+  }
+
+  /**
+   * The type-parameter binder a `Var` of a term written at binder `position` refers to.  The
+   * term lives in the context of the preceding binders, so the binder at position `q` has
+   * index `position - 1 - q` there.
+   */
+  private typeParameterAt(signature: SignatureIR, position: number, term: Term): Binder | undefined {
+    if (term.tag !== "Var") return undefined;
+    const binder = signature.binders[position - 1 - term.index];
+    return binder !== undefined && binder.role === "type-param" ? binder : undefined;
+  }
+
+  /** The type argument a `readonly T[]` argument fixes. */
+  private typeArgumentForElement(ctx: Ctx, type: TypeIR): Term | undefined {
+    return type.kind === "vec" && type.elem !== undefined ? this.typeArgumentForType(ctx, type.elem) : undefined;
+  }
+
+  /** The kernel type an extractor type denotes, when it is a type term this context can name. */
+  private typeArgumentForType(ctx: Ctx, type: TypeIR): Term | undefined {
+    switch (type.kind) {
+      case "int":
+        return K.Int;
+      case "union":
+        return type.union?.sumType;
+      case "generic": {
+        const name = type.typeParam;
+        if (name === undefined) return undefined;
+        for (let i = ctx.binders.length - 1; i >= 0; i -= 1) {
+          const binder = ctx.binders[i]!;
+          if (binder.role === "type-param" && (binder.surface ?? binder.name) === name) {
+            return K.varTerm(deBruijnIndex(ctx, binder));
+          }
+        }
+        return undefined;
+      }
+      default:
+        return undefined;
+    }
   }
 
   private typeArgumentFor(ctx: Ctx, type: TypeIR, name: string): Term | undefined {

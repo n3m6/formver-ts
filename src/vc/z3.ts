@@ -181,21 +181,34 @@ function detectProblem(output: string): string | undefined {
   return undefined;
 }
 
+/**
+ * The timeout that actually goes into the script.
+ *
+ * SMT-LIB's `:timeout 0` means "no timeout" (measured: a 9.7 s instance ran to completion), so
+ * a zero — or a negative or non-finite value — would silently *remove* the bound a verifier
+ * must never lose. Those mean "use the default" instead; only a positive finite number is
+ * taken literally.
+ */
+export function effectiveTimeout(timeoutMs: number | undefined): number {
+  if (timeoutMs === undefined || !Number.isFinite(timeoutMs) || timeoutMs <= 0) return DEFAULT_TIMEOUT_MS;
+  return Math.floor(timeoutMs);
+}
+
 function wrap(script: string, timeoutMs: number): string {
-  return `(push)\n(set-option :timeout ${Math.max(0, Math.floor(timeoutMs))})\n${script}\n(pop)\n`;
+  return `(push)\n(set-option :timeout ${effectiveTimeout(timeoutMs)})\n${script}\n(pop)\n`;
 }
 
 /**
  * Run one SMT-LIB query. The script is wrapped in `(push)`/`(pop)` and preceded by a
- * per-query timeout. On any error (including Z3's `unsupported` line) the context is
- * recreated and `ok: false` is returned; a `sat`/`unsat`/`unknown` verdict is *not* an
- * error and comes back as `ok: true` with the text in `output`.
+ * per-query timeout (`0` and negative values mean {@link DEFAULT_TIMEOUT_MS}, never "no
+ * timeout"). On any error (including Z3's `unsupported` line) the context is recreated and
+ * `ok: false` is returned; a `sat`/`unsat`/`unknown` verdict is *not* an error and comes back
+ * as `ok: true` with the text in `output`.
  */
 export function evalScript(script: string, opts: { timeoutMs?: number } = {}): Z3EvalResult {
   const ready = ensure();
   if ("error" in ready) return { ok: false, output: "", error: ready.error };
-  const timeoutMs = opts.timeoutMs === undefined ? DEFAULT_TIMEOUT_MS : opts.timeoutMs;
-  const input = Buffer.from(wrap(script, timeoutMs) + "\0", "utf8");
+  const input = Buffer.from(wrap(script, opts.timeoutMs ?? DEFAULT_TIMEOUT_MS) + "\0", "utf8");
   let raw: string | null;
   try {
     raw = ready.lib.symbols.Z3_eval_smtlib2_string(ready.context, ptr(input));
