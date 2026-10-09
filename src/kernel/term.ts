@@ -322,6 +322,14 @@ export const pairMk =
   (scope) =>
     pair(sigmaType(scope), first(scope), second(scope));
 
+export const farkasMk =
+  (hyps: readonly Mk[], coeffs: readonly bigint[]): Mk =>
+  (scope) =>
+    farkasTerm(
+      hyps.map((hyp) => hyp(scope)),
+      coeffs,
+    );
+
 export const fstMk =
   (pairTerm: Mk): Mk =>
   (scope) =>

@@ -239,12 +239,22 @@ function inferPrim(
   }
   // The op's type is a closed Pi telescope; walk it, checking each argument in turn.
   let type = evalTerm(ctx.env, info.typeFor(level), []);
-  for (const arg of args) {
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index]!;
     if (type.tag !== "Pi") {
       return err(kernelError("internal", `the type of built-in ${op} is not a Pi telescope`, { op }));
     }
     const argCheck = check(ctx, arg, type.domain);
     if (!argCheck.ok) return argCheck;
+    if (info.positiveLiteralArgs?.includes(index) === true && (arg.tag !== "IntLit" || arg.value <= 0n)) {
+      return err(
+        kernelError(
+          "prim-not-literal",
+          `${op} requires argument ${index + 1} to be a positive integer literal (only then is its built-in lemma sound), but got ${formatTerm(arg)}`,
+          { term: whole, op },
+        ),
+      );
+    }
     type = applyClosure(ctx.env, type.codomain, evalTerm(ctx.env, arg, ctx.values));
   }
   return ok(type);
@@ -252,7 +262,8 @@ function inferPrim(
 
 /**
  * `Farkas { hyps, coeffs } : Empty` when `farkas.ts` accepts the certificate for the
- * *types* of the hypotheses. Each hypothesis is checked as a term first.
+ * *types* of the hypotheses. Each hypothesis is checked as a term first; its inferred type
+ * is handed over as a value, so rows come from linear normal forms rather than syntax.
  */
 function inferFarkas(
   ctx: Ctx,
@@ -260,11 +271,11 @@ function inferFarkas(
   coeffs: readonly bigint[],
   whole: Term,
 ): Result<Value, KernelError> {
-  const hypTypes: Term[] = [];
+  const hypTypes: Value[] = [];
   for (const hyp of hyps) {
     const inferred = infer(ctx, hyp);
     if (!inferred.ok) return inferred;
-    hypTypes.push(quote(ctx.env, ctx.values.length, inferred.value));
+    hypTypes.push(inferred.value);
   }
   const verdict = checkFarkas({ hypTypes, coeffs });
   if (!verdict.ok) return err({ ...verdict.error, term: whole });

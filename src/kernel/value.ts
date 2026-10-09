@@ -24,6 +24,38 @@ export interface Closure {
   readonly env: readonly Value[];
 }
 
+/**
+ * One atom of a linear form: a canonical key, its non-zero integer coefficient, and a
+ * *representative* value whose canonical key is exactly `key`.
+ *
+ * The key is what conversion and `farkas.ts` compare; the representative exists only so
+ * that `quote.ts` can read a linear value back as a term (a key string cannot be turned
+ * back into a value on its own). Two atoms with the same key are always convertible, so
+ * keeping the first representative is enough.
+ */
+export interface LinearAtom {
+  readonly key: string;
+  readonly coefficient: bigint;
+  readonly repr: Value;
+}
+
+/**
+ * A linear form: a constant plus a map from atom key to atom, with no zero coefficients.
+ * `LinearValue` is the same thing as a value of type `Int`.
+ */
+export interface LinearForm {
+  readonly k: bigint;
+  readonly atoms: ReadonlyMap<string, LinearAtom>;
+}
+
+/**
+ * A linear value of type `Int`, i.e. a linear form. See `linear.ts` for how keys are
+ * computed.
+ */
+export interface LinearValue extends LinearForm {
+  readonly tag: "Linear";
+}
+
 /** The head of a neutral value. */
 export type Head =
   | { readonly tag: "Var"; readonly level: Level }
@@ -42,13 +74,17 @@ export type Value =
   | { readonly tag: "Pair"; readonly sigma: Value; readonly first: Value; readonly second: Value }
   | { readonly tag: "IntLit"; readonly value: bigint }
   /**
+   * A value of type `Int` that is not a literal: `k + Σ cᵢ · xᵢ` over atom keys. Every
+   * value built from literals with `add`, `sub`, `neg` and `mulConst` reduces to one of
+   * these (`IntLit` is the atom-free case), and conversion of `Int` values compares linear
+   * forms. Milestone 2 had only `IntLit`.
+   */
+  | LinearValue
+  /**
    * A checked Farkas certificate, the only way to inhabit `Empty`. It is a proof, never
    * computed with: `absurd` has no reduction rule, and one cannot eliminate `Empty` into
    * a value. Conversion treats all certificates as equal (both have type `Empty`, and all
    * proofs of a proposition are interchangeable for the kernel's purposes).
-   *
-   * Milestone 3 adds a `Linear` variant here: a constant plus a map from atom keys to
-   * bigint coefficients. `IntLit` is the atom-free special case.
    */
   | { readonly tag: "Farkas"; readonly hyps: readonly Term[]; readonly coeffs: readonly bigint[] }
   | NeutralValue;
@@ -60,6 +96,18 @@ export type Value =
 export const vsort = (level: Level): Value => ({ tag: "Sort", level });
 
 export const vint = (value: bigint): Value => ({ tag: "IntLit", value });
+
+/**
+ * A linear value: drops zero coefficients, and returns a plain `IntLit` when no atom is
+ * left, so that "atom-free linear value" and "literal" are the same value everywhere.
+ */
+export function vlinear(k: bigint, atoms: ReadonlyMap<string, LinearAtom>): Value {
+  const kept = new Map<string, LinearAtom>();
+  for (const [key, atom] of atoms) {
+    if (atom.coefficient !== 0n) kept.set(key, atom);
+  }
+  return kept.size === 0 ? vint(k) : { tag: "Linear", k, atoms: kept };
+}
 
 export const vpi = (name: string, domain: Value, codomain: Closure): Value => ({
   tag: "Pi",
@@ -162,8 +210,12 @@ export type GlobalInfo =
  *   is opaque precisely by having no `reduce`.
  * - `irrelevant` lists 0-based argument positions that conversion ignores (proof
  *   irrelevance) and that atom keys erase. `convArgs` is a full custom conversion rule
- *   (`Le` and `Vec` in milestone 3); returning `undefined` means "compare argument-wise,
- *   skipping `irrelevant` positions".
+ *   (`Le` in milestone 3); returning `undefined` means "compare argument-wise, skipping
+ *   `irrelevant` positions".
+ * - `positiveLiteralArgs` lists 0-based positions that `check.ts` requires to be a
+ *   *positive integer literal* term. It exists for one reason only: `divFloor`/`divTrunc`
+ *   and their spec lemmas are trusted for `k > 0`, so a variable or non-positive divisor
+ *   would make the built-in lemmas assert something false.
  */
 export interface PrimInfo {
   readonly name: PrimOp;
@@ -172,4 +224,5 @@ export interface PrimInfo {
   readonly reduce?: (args: readonly Value[], ctx: ReduceCtx) => Value | undefined;
   readonly irrelevant?: readonly number[];
   readonly convArgs?: (a: readonly Value[], b: readonly Value[]) => boolean | undefined;
+  readonly positiveLiteralArgs?: readonly number[];
 }

@@ -11,9 +11,10 @@
  * Primitive ops are compared through `convArgs` when the registry provides one, and
  * otherwise argument-wise while skipping `irrelevant` positions (proof irrelevance).
  */
-import { lookupPrim } from "./builtins";
+import { irrelevantOf, lookupPrim } from "./builtins";
 import type { Env } from "./env";
 import { applyClosure, applyValue, evalTerm, fstOf, sndOf } from "./eval";
+import { formEquals, formOf } from "./linear";
 import type { Level, Term } from "./term";
 import type { Closure, Head, NeutralValue, PrimInfo, Value } from "./value";
 import { vvar } from "./value";
@@ -57,6 +58,12 @@ export function convValue(env: Env, depth: Level, a: Value, b: Value): boolean {
     return convValue(env, depth, a.first, b.first) && convValue(env, depth, a.second, b.second);
   }
   if (a.tag === "IntLit" && b.tag === "IntLit") return a.value === b.value;
+  // Integer values compare by linear normal form, so `n + 0`, `0 + n` and `n` are the same
+  // value, and a length written as an expression is convertible with the bare variable it
+  // normalizes to. Atoms are identified by their canonical key (`linear.ts`).
+  if (a.tag === "Linear" || b.tag === "Linear") {
+    return formEquals(formOf(a, irrelevantOf), formOf(b, irrelevantOf));
+  }
   // All certificates prove `Empty`, so any two of them are interchangeable.
   if (a.tag === "Farkas" && b.tag === "Farkas") return true;
 

@@ -209,13 +209,13 @@ describe("primitive conversion hooks", () => {
     expect(K.convPrimArgs(undefined, [a], [c], eq)).toBe(false);
   });
 
-  test("`Le` currently converts structurally (standard conversion; milestone 3 adds the linear rule)", () => {
+  test("`Le` converts by the linear normal form of `b - a`", () => {
     expect(K.isConvertible(base, K.Le(K.intLit(2), K.intLit(1)), K.Le(K.intLit(2), K.intLit(1)))).toBe(true);
-    // Not yet identified: these differ syntactically, so conversion says no. That is
-    // sound; milestone 3's `convArgs` makes them equal.
-    expect(K.isConvertible(base, K.Le(K.intLit(1), K.intLit(2)), K.Le(K.intLit(2), K.intLit(3)))).toBe(false);
-    // And it must never identify different bounds after the linear rule lands either.
+    // `Le 1 2` and `Le 2 3` are the same proposition: `b - a` is 1 for both.
+    expect(K.isConvertible(base, K.Le(K.intLit(1), K.intLit(2)), K.Le(K.intLit(2), K.intLit(3)))).toBe(true);
+    // ... and it must never identify different bounds.
     expect(K.isConvertible(base, K.Le(K.intLit(2), K.intLit(1)), K.Le(K.intLit(2), K.intLit(2)))).toBe(false);
+    expect(K.isConvertible(base, K.Le(K.intLit(1), K.intLit(2)), K.Le(K.intLit(1), K.intLit(3)))).toBe(false);
   });
 
   test("proof irrelevance is expressible through the registry shape", () => {

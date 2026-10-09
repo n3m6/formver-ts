@@ -19,6 +19,8 @@ export type KernelErrorReason =
   | "not-a-sigma"
   | "not-a-type"
   | "type-mismatch"
+  /** Milestone 3: a built-in argument that must be a positive integer literal is not. */
+  | "prim-not-literal"
   | "duplicate-decl"
   | "ill-typed-decl"
   | "invalid-axiom"

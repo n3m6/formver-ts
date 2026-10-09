@@ -1,44 +1,28 @@
 /**
  * The Farkas rule (specification section 6.1.4): `Farkas { hyps, coeffs } : Empty`.
  *
- * Milestone 2 implements the *arithmetic* completely — row tightening by the GCD of the
- * coefficients, and the certificate check `Σ λᵢ aᵢ = 0` per atom with `Σ λᵢ bᵢ < 0` — and
- * extracts rows for hypotheses whose type is `Le a b` between integer *literals*, which
- * is enough for `Farkas` to be typeable as `Empty` end to end.
+ * A hypothesis whose type is `Le s t` becomes the row `c · atoms <= b`, where the linear
+ * form of `s - t` is `Σ cᵢ xᵢ + k` and `b = -k` (so `s <= t` reads as `s - t <= 0`).
+ * Every row is tightened by the GCD of its non-zero coefficients, and the certificate is
+ * accepted when the multipliers are non-negative, cancel every atom, and leave a negative
+ * bound. All arithmetic is `bigint`.
  *
- * Milestone 3 replaces `rowOfLe` with extraction from the linear normal form of `t - s`
- * (values of type `Int` built from literals, `add`, `sub`, `neg`, `mulConst`), keyed by
- * canonical atom keys with irrelevant proof arguments erased. Nothing else in this file
- * changes: `tightenRow` and `checkCertificate` are already final, and `src/vc/linear.ts`
- * must duplicate them exactly so that the multipliers it finds are accepted here.
+ * `tightenRow` and `checkCertificate` are the arithmetic that the untrusted
+ * `src/vc/linear.ts` deliberately duplicates in milestone 6, so their signatures and
+ * semantics are frozen. `gcd`/`floorDiv` live in `linear.ts` (the trusted module that
+ * needs them for `divFloor`/`divTrunc`) and are re-exported here.
  */
-import { OP_LE } from "./builtins";
+import { OP_LE, irrelevantOf } from "./builtins";
 import { err, kernelError, ok, type KernelError, type Result } from "./errors";
-import { formatTerm, type Term } from "./term";
+import { floorDiv, formOf, formSub, gcd, keyOfValue } from "./linear";
+import { constructorHead, type Value } from "./value";
+
+export { floorDiv, gcd };
 
 /** A linear row `Σ aᵢ · xᵢ <= b` over integer-valued atoms, after tightening. */
 export interface Row {
   readonly a: Readonly<Record<string, bigint>>;
   readonly b: bigint;
-}
-
-/** Non-negative greatest common divisor; `gcd(0, 0) = 0`. */
-export function gcd(a: bigint, b: bigint): bigint {
-  let x = a < 0n ? -a : a;
-  let y = b < 0n ? -b : b;
-  while (y !== 0n) {
-    const next = x % y;
-    x = y;
-    y = next;
-  }
-  return x;
-}
-
-/** Floor division for a positive divisor (`bigint` division truncates toward zero). */
-export function floorDiv(a: bigint, b: bigint): bigint {
-  const quotient = a / b;
-  const remainder = a % b;
-  return remainder !== 0n && remainder < 0n ? quotient - 1n : quotient;
 }
 
 /**
@@ -82,9 +66,13 @@ export function checkCertificate(rows: readonly Row[], coefficients: readonly bi
   return bound < 0n;
 }
 
-/** The kernel's view of one certificate: hypothesis types, and one coefficient each. */
+/**
+ * The kernel's view of one certificate: the hypotheses' *inferred types* as values, in
+ * order, and one multiplier each. `check.ts` passes the values it already inferred, so
+ * rows are built from semantic values rather than by re-parsing terms.
+ */
 export interface FarkasRule {
-  readonly hypTypes: readonly Term[];
+  readonly hypTypes: readonly Value[];
   readonly coeffs: readonly bigint[];
 }
 
@@ -117,8 +105,8 @@ export function checkFarkas(rule: FarkasRule): Result<void, KernelError> {
   return ok(undefined);
 }
 
-/** One row per hypothesis type, which must be `Le s t` (`Lt` unfolds to `Le` in eval). */
-function rowsOf(hypTypes: readonly Term[]): Result<Row[], KernelError> {
+/** One row per hypothesis type, whose weak head normal form must be `Le s t`. */
+function rowsOf(hypTypes: readonly Value[]): Result<Row[], KernelError> {
   const rows: Row[] = [];
   for (const type of hypTypes) {
     const row = rowOfLe(type);
@@ -129,32 +117,37 @@ function rowsOf(hypTypes: readonly Term[]): Result<Row[], KernelError> {
 }
 
 /**
- * `Le s t` means `s <= t`, that is `s - t <= 0`, that is `0 <= t - s`: the row has the
- * coefficients of the atoms of `s - t` and bound `t - s`.
- *
- * Milestone 2: only literal bounds, so the row has no atoms. Milestone 3 generalizes this
- * to the linear normal form of `s - t` over atom keys.
+ * The row of a hypothesis whose type is `Le s t`: `s - t <= 0`, so it takes the
+ * coefficients of the linear form of `s - t` and the bound `-k`, where `k` is that form's
+ * constant. `Lt a b` is the definition `Le (a + 1) b`, so it is already `Le` by the time a
+ * value reaches here. Exported for the tests and for milestone 6's comparison against
+ * `src/vc/linear.ts`.
  */
-function rowOfLe(type: Term): Result<Row, KernelError> {
-  if (type.tag !== "Prim" || type.op !== OP_LE || type.args.length !== 2) {
+export function rowOfLe(type: Value): Result<Row, KernelError> {
+  const head = constructorHead(type);
+  if (head === undefined || head.op !== OP_LE || head.args.length !== 2) {
     return err(
       kernelError(
         "farkas-not-a-le-hypothesis",
-        `a Farkas hypothesis must have type Le s t, but this one has type ${formatTerm(type)}`,
-        { term: type, op: type.tag === "Prim" ? type.op : undefined },
+        `a Farkas hypothesis must have type Le s t, but this one has type ${describe(type)}`,
+        { op: head?.op },
       ),
     );
   }
-  const lhs = type.args[0];
-  const rhs = type.args[1];
-  if (lhs === undefined || rhs === undefined || lhs.tag !== "IntLit" || rhs.tag !== "IntLit") {
-    return err(
-      kernelError(
-        "farkas-unimplemented",
-        "milestone 2 checks only certificates whose hypotheses are Le between integer literals; linear normal forms over atoms arrive in milestone 3",
-        { term: type },
-      ),
-    );
-  }
-  return ok({ a: {}, b: rhs.value - lhs.value });
+  const lhs = head.args[0]!;
+  const rhs = head.args[1]!;
+  const form = formSub(formOf(lhs, irrelevantOf), formOf(rhs, irrelevantOf));
+  const a: Record<string, bigint> = {};
+  for (const [key, atom] of form.atoms) a[key] = atom.coefficient;
+  return ok({ a, b: -form.k });
 }
+
+/** A best-effort rendering of a value for diagnostics; never throws. */
+function describe(value: Value): string {
+  try {
+    return keyOfValue(value, irrelevantOf);
+  } catch {
+    return "<unprintable>";
+  }
+}
+

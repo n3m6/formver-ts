@@ -166,7 +166,9 @@ describe("ill-typed pairs", () => {
 describe("primitive ops", () => {
   test("unknown ops are rejected, not ignored", () => {
     expectReason(K.inferType(env, K.primTerm("NoSuchOp", [])), "unknown-prim");
-    expectReason(K.inferType(env, K.primTerm("get", [K.tt])), "unknown-prim");
+    expectReason(K.inferType(env, K.primTerm("noSuchOpEither", [K.tt])), "unknown-prim");
+    // `get` is a milestone-3 built-in, so its wrong *arity* is reported as such.
+    expectReason(K.inferType(env, K.primTerm(K.OP_GET, [K.tt])), "prim-arity");
   });
 
   test("wrong arity is rejected", () => {
@@ -254,10 +256,26 @@ describe("Farkas typing", () => {
     expectReason(K.inferType(env, K.Farkas([], [])), "farkas-invalid");
   });
 
-  test("certificates over atoms are the milestone 3 work and are refused for now", () => {
+  test("certificates over atoms are checked against the atom's linear row", () => {
+    // `h : Le x 0` is the row `x <= 0`, which no non-zero multiplier can cancel: the
+    // certificate is rejected, but as an arithmetic failure, not as "unsupported".
     const hypType = K.Le(K.varTerm(0), K.intLit(0));
-    const term = K.lam("x", K.Int, K.lam("h", hypType, K.Farkas([K.varTerm(0)], [1n])));
-    expectReason(K.checkType(env, term, K.pi("x", K.Int, K.pi("_", hypType, K.Empty))), "farkas-unimplemented");
+    const bogus = K.lam("x", K.Int, K.lam("h", hypType, K.Farkas([K.varTerm(0)], [1n])));
+    expectReason(K.checkType(env, bogus, K.pi("x", K.Int, K.pi("_", hypType, K.Empty))), "farkas-invalid");
+    // `h : Le x x` is the row `0 <= 0`: still no contradiction to be had.
+    const reflexive = K.Le(K.varTerm(0), K.varTerm(0));
+    const trivial = K.lam("x", K.Int, K.lam("h", reflexive, K.Farkas([K.varTerm(0)], [1n])));
+    expectReason(K.checkType(env, trivial, K.pi("x", K.Int, K.pi("_", reflexive, K.Empty))), "farkas-invalid");
+    // `Le x 0` and `Le 0 x` cannot both hold at once: now the certificate is accepted.
+    const reverse = K.Le(K.intLit(0), K.varTerm(0));
+    const contradiction = K.lam(
+      "x",
+      K.Int,
+      K.lam("h1", hypType, K.lam("h2", reverse, K.Farkas([K.varTerm(1), K.varTerm(0)], [1n, 1n]))),
+    );
+    expect(
+      K.checkType(env, contradiction, K.pi("x", K.Int, K.pi("_", hypType, K.pi("_", reverse, K.Empty)))).ok,
+    ).toBe(false);
   });
 
   test("a hypothesis that is not a proof is rejected by ordinary typing", () => {

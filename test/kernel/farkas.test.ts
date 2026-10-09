@@ -5,6 +5,7 @@
 import { describe, expect, test } from "bun:test";
 import * as K from "../../src/kernel/index";
 import { expectErr, expectOk } from "./helpers";
+import { addMk, byContraMk, farkasMk, intMk, leMk, ltMk, v } from "./helpers3";
 
 const env = K.emptyEnv();
 
@@ -107,40 +108,212 @@ describe("checkCertificate", () => {
 
 describe("checkFarkas", () => {
   const le = (a: number, b: number): K.Term => K.Le(K.intLit(a), K.intLit(b));
+  /** The rule takes the hypotheses' inferred *types* as values, as `check.ts` passes them. */
+  const hyp = (...types: K.Term[]): K.Value[] => types.map((type) => K.evalTerm(env, type, []));
 
   test("accepts a contradictory literal hypothesis", () => {
-    expect(expectOk(K.checkFarkas({ hypTypes: [le(2, 1)], coeffs: [1n] }))).toBeUndefined();
-    expect(expectOk(K.checkFarkas({ hypTypes: [le(0, -1)], coeffs: [5n] }))).toBeUndefined();
+    expect(expectOk(K.checkFarkas({ hypTypes: hyp(le(2, 1)), coeffs: [1n] }))).toBeUndefined();
+    expect(expectOk(K.checkFarkas({ hypTypes: hyp(le(0, -1)), coeffs: [5n] }))).toBeUndefined();
   });
 
   test("rejects a satisfiable hypothesis", () => {
-    expect(expectErr(K.checkFarkas({ hypTypes: [le(2, 2)], coeffs: [1n] })).reason).toBe("farkas-invalid");
-    expect(expectErr(K.checkFarkas({ hypTypes: [le(1, 2)], coeffs: [1n] })).reason).toBe("farkas-invalid");
+    expect(expectErr(K.checkFarkas({ hypTypes: hyp(le(2, 2)), coeffs: [1n] })).reason).toBe("farkas-invalid");
+    expect(expectErr(K.checkFarkas({ hypTypes: hyp(le(1, 2)), coeffs: [1n] })).reason).toBe("farkas-invalid");
   });
 
   test("rejects hypotheses that are not `Le`", () => {
-    expect(expectErr(K.checkFarkas({ hypTypes: [K.Unit], coeffs: [1n] })).reason).toBe(
+    expect(expectErr(K.checkFarkas({ hypTypes: [K.evalTerm(env, K.Unit, [])], coeffs: [1n] })).reason).toBe(
       "farkas-not-a-le-hypothesis",
     );
     expect(
-      expectErr(K.checkFarkas({ hypTypes: [K.Eq(K.Unit, K.tt, K.tt)], coeffs: [1n] })).reason,
+      expectErr(K.checkFarkas({ hypTypes: hyp(K.Eq(K.Unit, K.tt, K.tt)), coeffs: [1n] })).reason,
     ).toBe("farkas-not-a-le-hypothesis");
   });
 
   test("rejects a coefficient count mismatch and negative coefficients", () => {
-    expect(expectErr(K.checkFarkas({ hypTypes: [le(2, 1)], coeffs: [1n, 1n] })).reason).toBe("farkas-shape");
-    expect(expectErr(K.checkFarkas({ hypTypes: [le(2, 1), le(2, 1)], coeffs: [1n] })).reason).toBe("farkas-shape");
-    expect(expectErr(K.checkFarkas({ hypTypes: [le(2, 1)], coeffs: [-1n] })).reason).toBe(
+    expect(expectErr(K.checkFarkas({ hypTypes: hyp(le(2, 1)), coeffs: [1n, 1n] })).reason).toBe("farkas-shape");
+    expect(expectErr(K.checkFarkas({ hypTypes: hyp(le(2, 1), le(2, 1)), coeffs: [1n] })).reason).toBe("farkas-shape");
+    expect(expectErr(K.checkFarkas({ hypTypes: hyp(le(2, 1)), coeffs: [-1n] })).reason).toBe(
       "farkas-negative-coefficient",
     );
   });
 
-  test("refuses certificates over atoms, which arrive with the linear normal forms", () => {
-    const atomHyp = K.Le(K.varTerm(0), K.intLit(0));
-    expect(expectErr(K.checkFarkas({ hypTypes: [atomHyp], coeffs: [1n] })).reason).toBe("farkas-unimplemented");
+  test("builds rows over atoms from the linear normal form of s - t", () => {
+    // `Le x 0` is the row `x <= 0`, so a single multiplier cannot cancel its atom.
+    const xAt = K.evalTerm(env, K.Le(K.varTerm(0), K.intLit(0)), [K.vvar(0)]);
+    const row = expectOk(K.rowOfLe(xAt));
+    expect(row.b).toBe(0n);
+    expect(Object.values(row.a)).toEqual([1n]);
+    expect(expectErr(K.checkFarkas({ hypTypes: [xAt], coeffs: [1n] })).reason).toBe("farkas-invalid");
+    // `Le x x` is the row `0 <= 0`: no atom at all, and no contradiction either.
+    const xLeX = K.evalTerm(env, K.Le(K.varTerm(0), K.varTerm(0)), [K.vvar(0)]);
+    expect(expectOk(K.rowOfLe(xLeX))).toEqual({ a: {}, b: 0n });
+  });
+
+  test("rows over atoms: `-2x <= 0` together with `2x <= 0` refutes nothing", () => {
+    // `Le (-x) x` is the row `-2x <= 0` and `Le x (-x)` is `2x <= 0`; x = 0 satisfies
+    // both, so no multiplier can derive a contradiction.
+    const openLe = (lhs: K.Term, rhs: K.Term): K.Value => K.evalTerm(env, K.Le(lhs, rhs), [K.vvar(0)]);
+    const negX = K.Neg(K.varTerm(0));
+    const rows = [openLe(negX, K.varTerm(0)), openLe(K.varTerm(0), negX)];
+    const row = expectOk(K.rowOfLe(rows[0]!));
+    expect(row.b).toBe(0n);
+    expect(Object.values(row.a)).toEqual([-2n]);
+    expect(expectErr(K.checkFarkas({ hypTypes: rows, coeffs: [1n, 1n] })).reason).toBe("farkas-invalid");
+    // With the *strict* versions (`Lt`), integer tightening makes them contradictory.
+    const strict = [
+      K.evalTerm(env, K.Lt(negX, K.varTerm(0)), [K.vvar(0)]),
+      K.evalTerm(env, K.Lt(K.varTerm(0), negX), [K.vvar(0)]),
+    ];
+    expect(expectOk(K.checkFarkas({ hypTypes: strict, coeffs: [1n, 1n] }))).toBeUndefined();
   });
 
   test("an empty hypothesis list cannot prove false", () => {
     expect(expectErr(K.checkFarkas({ hypTypes: [], coeffs: [] })).reason).toBe("farkas-invalid");
+  });
+});
+
+describe("real certificates over atoms", () => {
+  // The bounds VC: from `0 <= i` and `i < n`, prove `i + 1 <= n`.
+  const boundsType = K.mk(
+    K.piMk(
+      "i",
+      intMk,
+      K.piMk(
+        "n",
+        intMk,
+        K.piMk(
+          "h1",
+          leMk(K.intLitMk(0n), v("i")),
+          K.piMk("h2", ltMk(v("i"), v("n")), leMk(addMk(v("i"), K.intLitMk(1n)), v("n"))),
+        ),
+      ),
+    ),
+  );
+  const boundsTerm = K.mk(
+    K.lamMk(
+      "i",
+      intMk,
+      K.lamMk(
+        "n",
+        intMk,
+        K.lamMk(
+          "h1",
+          leMk(K.intLitMk(0n), v("i")),
+          K.lamMk(
+            "h2",
+            ltMk(v("i"), v("n")),
+            byContraMk(
+              addMk(v("i"), K.intLitMk(1n)),
+              v("n"),
+              K.lamMk(
+                "k",
+                ltMk(v("n"), addMk(v("i"), K.intLitMk(1n))),
+                farkasMk([v("h1"), v("h2"), v("k")], [0n, 1n, 1n]),
+              ),
+            ),
+          ),
+        ),
+      ),
+    ),
+  );
+
+  test("the bounds VC is accepted with the multipliers [0, 1, 1]", () => {
+    // The rows, in the kernel's convention: `0 - i <= 0`, `(i + 1) - n <= -1` and
+    // `(n + 1) - (i + 1) <= 0`; λ = [0, 1, 1] cancels both atoms and leaves -1.
+    const i = K.vvar(0);
+    const n = K.vvar(1);
+    const hypTypes = [
+      K.evalTerm(env, K.Le(K.intLit(0), K.varTerm(1)), [i, n]),
+      K.evalTerm(env, K.Lt(K.varTerm(1), K.varTerm(0)), [i, n]),
+      K.evalTerm(env, K.Lt(K.varTerm(0), K.Add(K.varTerm(1), K.intLit(1))), [i, n]),
+    ];
+    expect(expectOk(K.checkFarkas({ hypTypes, coeffs: [0n, 1n, 1n] }))).toBeUndefined();
+    // Any other multiplier vector is rejected.
+    expect(expectErr(K.checkFarkas({ hypTypes, coeffs: [1n, 1n, 1n] })).reason).toBe("farkas-invalid");
+    expect(K.checkType(env, boundsTerm, boundsType).ok).toBe(true);
+  });
+
+  test("a certificate for a `clamp` path is accepted", () => {
+    // From `x + 1 <= lo` and `lo <= hi`, conclude `x <= hi`: rows `x - lo <= -1`,
+    // `lo - hi <= 0`, `hi - x <= -1`, and λ = [1, 1, 1] leaves -2.
+    const type = K.mk(
+      K.piMk(
+        "x",
+        intMk,
+        K.piMk(
+          "lo",
+          intMk,
+          K.piMk(
+            "hi",
+            intMk,
+            K.piMk(
+              "h1",
+              leMk(addMk(v("x"), K.intLitMk(1n)), v("lo")),
+              K.piMk("pre", leMk(v("lo"), v("hi")), leMk(v("x"), v("hi"))),
+            ),
+          ),
+        ),
+      ),
+    );
+    const term = K.mk(
+      K.lamMk(
+        "x",
+        intMk,
+        K.lamMk(
+          "lo",
+          intMk,
+          K.lamMk(
+            "hi",
+            intMk,
+            K.lamMk(
+              "h1",
+              leMk(addMk(v("x"), K.intLitMk(1n)), v("lo")),
+              K.lamMk(
+                "pre",
+                leMk(v("lo"), v("hi")),
+                byContraMk(
+                  v("x"),
+                  v("hi"),
+                  K.lamMk("k", ltMk(v("hi"), v("x")), farkasMk([v("h1"), v("pre"), v("k")], [1n, 1n, 1n])),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+    expect(K.checkType(env, term, type).ok).toBe(true);
+  });
+
+  test("the `?1` obligation of the clamp skeleton: Le lo lo", () => {
+    // λ = [0, 1]: the first hypothesis is unused, and `Lt lo lo` is refuted on its own.
+    const type = K.mk(
+      K.piMk(
+        "lo",
+        intMk,
+        K.piMk(
+          "h1",
+          leMk(addMk(v("lo"), K.intLitMk(1n)), v("lo")),
+          leMk(v("lo"), v("lo")),
+        ),
+      ),
+    );
+    const term = K.mk(
+      K.lamMk(
+        "lo",
+        intMk,
+        K.lamMk(
+          "h1",
+          leMk(addMk(v("lo"), K.intLitMk(1n)), v("lo")),
+          byContraMk(
+            v("lo"),
+            v("lo"),
+            K.lamMk("k", ltMk(v("lo"), v("lo")), farkasMk([v("k")], [1n])),
+          ),
+        ),
+      ),
+    );
+    expect(K.checkType(env, term, type).ok).toBe(true);
   });
 });

@@ -11,8 +11,9 @@
 import type { Env } from "./env";
 import { err, internalError, KernelInternalError, ok, type KernelError, type Result } from "./errors";
 import { applyClosure, evalTerm } from "./eval";
+import { OP_ADD, OP_MUL_CONST } from "./builtins";
 import { type Level, type Term, app, constTerm, farkasTerm, intLit, lam, pair, pi, primTerm, sigma, sort, varTerm } from "./term";
-import type { Head, Value } from "./value";
+import type { Head, LinearForm, Value } from "./value";
 import { vvar } from "./value";
 
 export function quote(env: Env, depth: Level, value: Value): Term {
@@ -21,6 +22,8 @@ export function quote(env: Env, depth: Level, value: Value): Term {
       return sort(value.level);
     case "IntLit":
       return intLit(value.value);
+    case "Linear":
+      return quoteLinear(env, depth, value);
     case "Pi":
       return pi(
         value.name,
@@ -53,6 +56,28 @@ export function quote(env: Env, depth: Level, value: Value): Term {
       return out;
     }
   }
+}
+
+/**
+ * Reads a linear value back as a term: `k + Σ cᵢ · rᵢ`, where each `rᵢ` is the quoted
+ * representative of an atom and `cᵢ * rᵢ` is `mulConst cᵢ rᵢ`. Evaluating the result gives
+ * a linear value with the same constant and the same atom keys, so quoting a type that
+ * mentions a linear length never loses information. A single atom with coefficient 1 and
+ * constant 0 is quoted as the atom itself.
+ */
+function quoteLinear(env: Env, depth: Level, value: LinearForm): Term {
+  const atoms = [...value.atoms.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+  const only = atoms.length === 1 ? atoms[0]![1] : undefined;
+  if (value.k === 0n && only !== undefined && only.coefficient === 1n) {
+    return quote(env, depth, only.repr);
+  }
+  let out: Term = intLit(value.k);
+  for (const [, atom] of atoms) {
+    const repr = quote(env, depth, atom.repr);
+    const term = atom.coefficient === 1n ? repr : primTerm(OP_MUL_CONST, [intLit(atom.coefficient), repr]);
+    out = primTerm(OP_ADD, [out, term]);
+  }
+  return out;
 }
 
 function quoteHead(env: Env, depth: Level, head: Head): Term {
