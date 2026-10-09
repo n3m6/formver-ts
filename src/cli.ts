@@ -40,7 +40,7 @@ interface CliOptions {
   readonly lenient: boolean;
 }
 
-interface FileSummary {
+export interface FileSummary {
   readonly file: string;
   readonly certified: number;
   readonly smtOnly: number;
@@ -202,7 +202,8 @@ function externalDiagnostics(result: VerifyResult, lenient: boolean): Diagnostic
   return out;
 }
 
-function summarize(file: string, result: VerifyResult): FileSummary {
+/** The per-file counts of the summary table; exported for `scripts/demo.ts`. */
+export function summarize(file: string, result: Pick<VerifyResult, "functions" | "axioms">): FileSummary {
   let certified = 0;
   let smtOnly = 0;
   let failed = 0;
@@ -216,7 +217,8 @@ function summarize(file: string, result: VerifyResult): FileSummary {
   return { file, certified, smtOnly, failed, rejected, axioms: result.axioms.length };
 }
 
-function printSummary(summaries: readonly FileSummary[], solverAvailable: boolean): void {
+/** Print the summary table `bun run verify` ends with; exported for `scripts/demo.ts`. */
+export function printSummary(summaries: readonly FileSummary[], solverAvailable: boolean): void {
   const width = Math.max(4, ...summaries.map((summary) => summary.file.length));
   const row = (file: string, values: readonly (string | number)[]): string =>
     `${file.padEnd(width)}  ${values.map((value) => String(value).padStart(9)).join("  ")}`;
